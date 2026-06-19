@@ -15,15 +15,19 @@ with st.sidebar:
     if uploaded_file:
         if st.button("Ingest Document"):
             with st.spinner("Ingesting..."):
-                response = requests.post(
-                    f"{API_URL}/upload",
-                    files={"file": (uploaded_file.name, uploaded_file, uploaded_file.type)},
-                )
-            if response.status_code == 200:
-                st.success(f"✅ {uploaded_file.name} ingested successfully!")
-                st.json(response.json())
-            else:
-                st.error(f"❌ Upload failed: {response.text}")
+                try:
+                    response = requests.post(
+                        f"{API_URL}/upload",
+                        files={"file": (uploaded_file.name, uploaded_file, uploaded_file.type)},
+                        timeout=10,
+                    )
+                    if response.status_code == 200:
+                        st.success(f"✅ {uploaded_file.name} ingested successfully!")
+                        st.json(response.json())
+                    else:
+                        st.error(f"❌ Upload failed: {response.text}")
+                except requests.exceptions.ConnectionError:
+                    st.warning("⚠️ Backend not running. Start FastAPI first.")
 
     st.divider()
     cross_doc = st.toggle("🔗 Cross-Document QA", value=False)
@@ -43,21 +47,26 @@ if query := st.chat_input("Ask a question about your documents..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            response = requests.post(
-                f"{API_URL}/query",
-                json={"query": query, "cross_doc": cross_doc},
-            )
+            try:
+                response = requests.post(
+                    f"{API_URL}/query",
+                    json={"query": query, "cross_doc": cross_doc},
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    answer = data.get("answer", "No answer returned.")
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
 
-        if response.status_code == 200:
-            data = response.json()
-            answer = data.get("answer", "No answer returned.")
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-
-            # Placeholder panels — will be populated in Day 3
-            with st.expander("📊 Evidence & Risk (coming Day 3)"):
-                st.json(data)
-        else:
-            err = f"❌ Query failed: {response.text}"
-            st.error(err)
-            st.session_state.messages.append({"role": "assistant", "content": err})
+                    # Placeholder panels — will be populated in Day 3
+                    with st.expander("📊 Evidence & Risk (coming Day 3)"):
+                        st.json(data)
+                else:
+                    err = f"❌ Query failed: {response.text}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+            except requests.exceptions.ConnectionError:
+                err = "⚠️ Backend not running. Start FastAPI first."
+                st.warning(err)
+                st.session_state.messages.append({"role": "assistant", "content": err})
