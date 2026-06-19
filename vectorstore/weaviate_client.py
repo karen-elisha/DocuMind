@@ -40,6 +40,8 @@ class WeaviateClient:
 
         # Weaviate Cloud / v4 connection
         # Disable startup checks because gRPC health checks can be blocked/slow from this environment.
+        print("WEAVIATE_URL =", Config.WEAVIATE_URL)
+        print("WEAVIATE_API_KEY present =", bool(api_key))
         self.client = weaviate.connect_to_weaviate_cloud(
             cluster_url=Config.WEAVIATE_URL,
             auth_credentials=auth_credentials,

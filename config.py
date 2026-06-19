@@ -13,8 +13,13 @@ class Config:
 
     # Weaviate
     WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+    if "//" not in WEAVIATE_URL:
+        if WEAVIATE_URL.startswith(("localhost", "127.0.0.1")):
+            WEAVIATE_URL = f"http://{WEAVIATE_URL}"
+        else:
+            WEAVIATE_URL = f"https://{WEAVIATE_URL}"
     WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY", "")
-    WEAVIATE_COLLECTION = os.getenv("WEAVIATE_COLLECTION", "DocumentNode")
+    WEAVIATE_COLLECTION = os.getenv("WEAVIATE_COLLECTION", "DocuMindNode")
 
     # Embeddings
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
