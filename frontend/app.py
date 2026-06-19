@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import streamlit as st
 import requests
 
@@ -70,3 +71,6 @@ if query := st.chat_input("Ask a question about your documents..."):
                 err = "⚠️ Backend not running. Start FastAPI first."
                 st.warning(err)
                 st.session_state.messages.append({"role": "assistant", "content": err})
+=======
+"""Empty file"""
+>>>>>>> 40f0ad3 (adding dockling process and tested it)

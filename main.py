@@ -1,9 +1,13 @@
 import os
 import shutil
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 from config import Config
+from ingestion.parser import parse_document
+from ingestion.vision_processor import summarize_images
+from ingestion.node_builder import run_ingestion_pipeline
 
 Config.validate()
 os.makedirs(Config.UPLOADS_DIR, exist_ok=True)
@@ -12,7 +16,7 @@ os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
 app = FastAPI(
     title="DocuMind Graph API",
     description="Agentic KG-RAG with Negative Graph Expansion",
-    version="2.0"
+    version="2.0",
 )
 
 app.add_middleware(
@@ -27,60 +31,70 @@ class QueryRequest(BaseModel):
     query: str
     cross_doc: bool = False
 
+
 @app.get("/")
 async def root():
-    return {
-        "status": "healthy",
-        "message": "DocuMind Graph v2.0 API is running."
-    }
+    return {"status": "healthy", "message": "DocuMind Graph v2.0 API is running."}
+
 
 @app.post("/upload", status_code=status.HTTP_201_CREATED)
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     allowed_extensions = {".pdf", ".docx"}
     _, ext = os.path.splitext(file.filename.lower())
 
     if ext not in allowed_extensions:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file format: {ext}. Only PDF and DOCX are allowed."
+            detail=f"Unsupported file format: {ext}. Only PDF and DOCX are allowed.",
         )
 
     file_path = os.path.join(Config.UPLOADS_DIR, file.filename)
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
+        doc_id = os.path.splitext(file.filename)[0]
+
+        def _ingest():
+            import time
+            parse_result = parse_document(file_path=file_path, doc_id=doc_id)
+            if Config.ENABLE_VISION:
+                t0 = time.perf_counter()
+                vision_results = summarize_images(parse_result.get("images", []) or [])
+                print(f"[Timer] Vision Processing: {time.perf_counter()-t0:.2f}s")
+            else:
+                vision_results = {}
+            run_ingestion_pipeline(parse_result=parse_result, vision_results=vision_results)
+
+        background_tasks.add_task(_ingest)
+
         return {
             "filename": file.filename,
+            "doc_id": doc_id,
             "status": "success",
-            "message": "File uploaded successfully. Ingestion will follow."
+            "message": "File uploaded successfully. Ingestion started in background.",
         }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save file: {str(e)}"
+            detail=f"Failed to save file: {str(e)}",
         )
+
 
 @app.post("/query")
 async def query_pipeline(request: QueryRequest):
     if not request.query.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Query cannot be empty."
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Query cannot be empty.")
 
     return {
         "query": request.query,
         "cross_doc": request.cross_doc,
         "response": "FastAPI skeleton response. Orchestration layer integration coming in Day 2.",
         "confidence_score": 0.0,
-        "evidence": {
-            "supporting": [],
-            "exceptions": [],
-            "contradictions": [],
-            "risks": []
-        },
-        "risk_level": "None"
+        "evidence": {"supporting": [], "exceptions": [], "contradictions": [], "risks": []},
+        "risk_level": "None",
     }
+
 
 if __name__ == "__main__":
     import uvicorn
