@@ -57,7 +57,7 @@ def _graphql_fetch_by_node_id(class_name: str, node_id: str) -> dict:
 
 
 def main() -> None:
-    class_name = getattr(Config, "WEAVIATE_COLLECTION", None) or "DocumentNode"
+    class_name = getattr(Config, "WEAVIATE_COLLECTION", None) or "DocuMindNode"
 
     test_node_id = "node_test_smoke_once"
     test_doc_id = "doc_test_smoke_once"

@@ -320,7 +320,7 @@ def store_chunks_weaviate(
     collection_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     if collection_name is None:
-        collection_name = getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
+        collection_name = getattr(Config, "WEAVIATE_COLLECTION", "DocuMindNode")
     chunks = chunked_embedded.get("chunks", [])
     weaviate = WeaviateClient()
     weaviate.upsert_chunks(collection_name=collection_name, chunks=chunks)
@@ -373,7 +373,7 @@ def run_ingestion_pipeline(
     if enable_weaviate is None:
         enable_weaviate = getattr(Config, "ENABLE_WEAVIATE", False)
     if weaviate_collection is None:
-        weaviate_collection = getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
+        weaviate_collection = getattr(Config, "WEAVIATE_COLLECTION", "DocuMindNode")
 
     if not enable_vision:
         vision_results = {}

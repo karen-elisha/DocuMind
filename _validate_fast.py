@@ -151,7 +151,7 @@ from vectorstore.weaviate_client import WeaviateClient
 
 try:
     wc = WeaviateClient()
-    col = "DocumentNode"
+    col = "DocuMindNode"
     
     from ingestion.node_builder import store_chunks_weaviate
     stored = store_chunks_weaviate(embedded, collection_name=col)

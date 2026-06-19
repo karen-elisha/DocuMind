@@ -223,7 +223,7 @@ from vectorstore.weaviate_client import WeaviateClient
 
 try:
     wc = WeaviateClient()
-    col = "DocumentNode"
+    col = "DocuMindNode"
 
     # Count before
     try:
