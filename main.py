@@ -5,7 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from config import Config
 
-# Initialize and validate configurations
 Config.validate()
 os.makedirs(Config.UPLOADS_DIR, exist_ok=True)
 os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
@@ -16,7 +15,6 @@ app = FastAPI(
     version="2.0"
 )
 
-# Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request schema for query endpoint
 class QueryRequest(BaseModel):
     query: str
     cross_doc: bool = False
@@ -39,23 +36,19 @@ async def root():
 
 @app.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Accepts document uploads (PDF, DOCX) and saves them in the upload directory.
-    """
     allowed_extensions = {".pdf", ".docx"}
     _, ext = os.path.splitext(file.filename.lower())
-    
+
     if ext not in allowed_extensions:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file format: {ext}. Only PDF and DOCX are allowed."
         )
-    
+
     file_path = os.path.join(Config.UPLOADS_DIR, file.filename)
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
         return {
             "filename": file.filename,
             "status": "success",
@@ -69,16 +62,12 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query_pipeline(request: QueryRequest):
-    """
-    Query endpoint which will orchestrate Hybrid Search, Positive/Negative Graph Expansion, 
-    and LLM generation (Day 2 task).
-    """
     if not request.query.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Query cannot be empty."
         )
-        
+
     return {
         "query": request.query,
         "cross_doc": request.cross_doc,
