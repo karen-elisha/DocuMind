@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
 
 import weaviate
@@ -7,6 +8,8 @@ from weaviate.util import generate_uuid5
 from weaviate.auth import AuthApiKey
 
 from config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class WeaviateClient:
@@ -40,8 +43,8 @@ class WeaviateClient:
 
         # Weaviate Cloud / v4 connection
         # Disable startup checks because gRPC health checks can be blocked/slow from this environment.
-        print("WEAVIATE_URL =", Config.WEAVIATE_URL)
-        print("WEAVIATE_API_KEY present =", bool(api_key))
+        logger.info("WEAVIATE_URL = %s", Config.WEAVIATE_URL)
+        logger.info("WEAVIATE_API_KEY present = %s", bool(api_key))
         self.client = weaviate.connect_to_weaviate_cloud(
             cluster_url=Config.WEAVIATE_URL,
             auth_credentials=auth_credentials,
@@ -55,7 +58,7 @@ class WeaviateClient:
             if callable(close_fn):
                 close_fn()
         except Exception:
-            pass
+            logger.exception("Failed to close Weaviate client")
 
     def _ensure_collection(self, collection_name: str) -> None:
         """
@@ -211,3 +214,31 @@ class WeaviateClient:
         )
         with urlrequest.urlopen(req, timeout=60) as resp:
             _ = resp.read()
+
+    def semantic_search(
+        self,
+        query_vector: list,
+        collection_name: str | None = None,
+        limit: int = 10,
+    ):
+        collection_name = (
+            collection_name
+            or getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
+        )
+        collection = self.client.collections.get(collection_name)
+        response = collection.query.near_vector(near_vector=query_vector, limit=limit)
+        return response.objects
+
+    def keyword_search(
+        self,
+        query: str,
+        collection_name: str | None = None,
+        limit: int = 10,
+    ):
+        collection_name = (
+            collection_name
+            or getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
+        )
+        collection = self.client.collections.get(collection_name)
+        response = collection.query.bm25(query=query, limit=limit)
+        return response.objects
