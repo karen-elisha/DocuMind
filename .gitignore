@@ -1,0 +1,31 @@
+# DocuMind Graph — .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# Generated outputs
+data/uploads/*
+data/processed/*
+data/*.png
+data/*.html
+!data/.gitkeep
+!data/uploads/.gitkeep
+!data/processed/.gitkeep

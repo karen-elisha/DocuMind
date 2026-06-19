@@ -1,0 +1,7 @@
+# DocuMind Graph — Karen's Dependencies
+# Graph Engine & Expansion
+networkx>=3.1
+
+# Visualization
+matplotlib>=3.7
+pyvis>=0.3.2
