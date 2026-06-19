@@ -2,5 +2,30 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
 .vscode/
+
+# Test and lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.env 
