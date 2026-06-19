@@ -97,5 +97,9 @@ async def query_pipeline(request: QueryRequest):
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+=======
+    main()
+>>>>>>> daeef56 (merge conflicts)
