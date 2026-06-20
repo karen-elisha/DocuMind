@@ -32,6 +32,8 @@ VALID_NODE_TYPES = {
     "caption",
     "footnote",
     "chart",
+    "list_item",   # Added for ingestion pipeline compatibility
+    "formula",     # Added for ingestion pipeline compatibility
 }
 
 POSITIVE_EDGE_TYPES = {

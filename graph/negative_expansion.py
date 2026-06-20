@@ -587,6 +587,17 @@ class NegativeExpander:
                 ):
                     targets.add(nid)
 
+        # 4. Fallback — same page (handles docs with no section metadata)
+        if not targets and node_page is not None:
+            for nid, attrs in graph.graph.nodes(data=True):
+                if (
+                    nid != node_id
+                    and attrs.get("page") == node_page
+                    and attrs.get("type") in ("paragraph", "heading", "table")
+                    and (node_doc is None or attrs.get("doc_id") == node_doc)
+                ):
+                    targets.add(nid)
+
         return list(targets)
 
     def __repr__(self) -> str:
