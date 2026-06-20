@@ -35,6 +35,9 @@ class Timer:
 
 SUPPORTED_NODE_TYPES = {"heading", "paragraph", "table", "image", "caption", "footnote", "list_item", "formula"}
 
+MERGEABLE_TYPES = {"paragraph", "list_item"}
+MIN_CONTENT_LEN = 80  # merge fragments shorter than this into the next sibling
+
 
 @dataclass
 class Node:
@@ -59,6 +62,57 @@ def _safe_int(x: Any, default: int = 1) -> int:
         return default
 
 
+def _merge_short_nodes(nodes: List[Node]) -> List[Node]:
+    """
+    Merge consecutive short fragments on the same page and of the same type
+    into a single node so that split inline text like:
+        'Timeline:' + '24 hours |' + 'Team:' + '4 members'
+    becomes one node: 'Timeline: 24 hours | Team: 4 members'
+    """
+    if not nodes:
+        return nodes
+
+    merged: List[Node] = []
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
+        # Only merge paragraph/list_item fragments
+        if node.type not in MERGEABLE_TYPES or len(node.content) >= MIN_CONTENT_LEN:
+            merged.append(node)
+            i += 1
+            continue
+
+        # Accumulate consecutive short siblings on the same page
+        parts = [node.content]
+        j = i + 1
+        while j < len(nodes):
+            nxt = nodes[j]
+            if (
+                nxt.type in MERGEABLE_TYPES
+                and nxt.page == node.page
+                and nxt.doc_id == node.doc_id
+                and len(" ".join(parts)) < MIN_CONTENT_LEN
+            ):
+                parts.append(nxt.content)
+                j += 1
+            else:
+                break
+
+        combined = " ".join(parts).strip()
+        merged.append(Node(
+            node_id=node.node_id,
+            doc_id=node.doc_id,
+            page=node.page,
+            type=node.type,
+            content=combined,
+            metadata=node.metadata,
+            section=node.section,
+        ))
+        i = j
+
+    return merged
+
+
 # ---- Singleton embeddings ----
 
 _embeddings_instance = None
@@ -80,11 +134,6 @@ def build_nodes(
     parse_result: Dict[str, Any],
     vision_results: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Convert extracted elements into normalized nodes.
-
-    Image nodes contain Groq-generated summaries (vision_results).
-    """
     doc_id = parse_result.get("doc_id")
     document_name = parse_result.get("document_name")
     elements = parse_result.get("elements", [])
@@ -107,8 +156,12 @@ def build_nodes(
         content = el.get("content") or ""
         metadata = dict(el.get("metadata") or {})
 
+        # Skip truly empty non-image nodes; short ones get merged below
+        if el_type != "image" and not content.strip():
+            continue
+
         node = Node(
-            node_id=_node_id(el_type),
+            node_id=el.get("element_id") or _node_id(el_type),
             doc_id=doc_id,
             page=page,
             type=el_type,
@@ -129,6 +182,12 @@ def build_nodes(
             node.metadata.setdefault("links_to_image", True)
 
         nodes.append(node)
+
+    # Merge short inline fragments (e.g. 'Timeline:' + '24 hours |' + 'Team:' + '4 members')
+    nodes = _merge_short_nodes(nodes)
+
+    # Drop anything still too short after merging (except images)
+    nodes = [n for n in nodes if n.type == "image" or len(n.content) >= 15]
 
     for idx, img in enumerate(images or []):
         img_path = img.get("image_path")

@@ -63,6 +63,7 @@ class DocuMindWeaviateClient:
 		self._client = weaviate.connect_to_weaviate_cloud(
 			cluster_url=self.cluster_url,
 			auth_credentials=Auth.api_key(self.api_key),
+			skip_init_checks=True,
 		)
 		return self._client
 
@@ -77,12 +78,19 @@ class DocuMindWeaviateClient:
 	def client(self) -> weaviate.WeaviateClient:
 		return self.connect()
 
+	def clear_collection(self) -> None:
+		"""Delete and recreate the collection to wipe all stored nodes."""
+		client = self.client
+		existing = client.collections.list_all()
+		if self.collection_name in existing:
+			client.collections.delete(self.collection_name)
+		self.ensure_schema()
+
 	def ensure_schema(self) -> None:
 		"""Create the semantic node collection if it does not exist yet."""
 
 		client = self.client
 
-		
 		existing = client.collections.list_all()
 		if self.collection_name in existing:
 			return
