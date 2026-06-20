@@ -31,13 +31,21 @@ class HybridRetriever:
         semantic_limit: int = 10,
         keyword_limit: int = 10,
         doc_id: Optional[str] = None,
+        cross_doc: bool = False,
     ) -> Dict[str, List]:
+        """
+        cross_doc=False → filter by doc_id (single-document retrieval)
+        cross_doc=True  → no doc_id filter (search across all indexed documents)
+        """
+        # cross_doc=True overrides doc_id filter
+        filter_doc_id = None if cross_doc else doc_id
+
         try:
             # Semantic search: high alpha = vector-weighted
             semantic_results = self.db.hybrid_search(
                 query=query,
                 limit=semantic_limit,
-                doc_id=doc_id,
+                doc_id=filter_doc_id,
                 alpha=0.9,
             )
 
@@ -45,7 +53,7 @@ class HybridRetriever:
             keyword_results = self.db.hybrid_search(
                 query=query,
                 limit=keyword_limit,
-                doc_id=doc_id,
+                doc_id=filter_doc_id,
                 alpha=0.1,
             )
         except Exception:
@@ -60,6 +68,7 @@ class HybridRetriever:
 
         return {
             "query": query,
+            "cross_doc": cross_doc,
             "semantic_results": semantic_results,
             "keyword_results": keyword_results,
         }
