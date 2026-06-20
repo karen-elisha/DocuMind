@@ -11,7 +11,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from config import Config
-from vectorstore.weaviate_client import WeaviateClient
+from vectorstore.weaviate_client import DocuMindWeaviateClient
 
 
 # ---- Timer ----
@@ -322,8 +322,8 @@ def store_chunks_weaviate(
     if collection_name is None:
         collection_name = getattr(Config, "WEAVIATE_COLLECTION", "DocuMindNode")
     chunks = chunked_embedded.get("chunks", [])
-    weaviate = WeaviateClient()
-    weaviate.upsert_chunks(collection_name=collection_name, chunks=chunks)
+    weaviate = DocuMindWeaviateClient(collection_name=collection_name)
+    weaviate.upsert_nodes(chunks)
     return {"stored": True, "count": len(chunks)}
 
 
