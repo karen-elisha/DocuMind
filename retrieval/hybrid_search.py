@@ -3,8 +3,7 @@
 import logging
 from typing import Dict, List, Optional
 
-from ingestion.node_builder import _get_embeddings
-from vectorstore.weaviate_client import WeaviateClient
+from vectorstore.weaviate_client import DocuMindWeaviateClient
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -19,7 +18,7 @@ class HybridRetriever:
     """
 
     def __init__(self):
-        self.db = WeaviateClient()
+        self.db = DocuMindWeaviateClient()
         self.collection_name = getattr(
             Config,
             "WEAVIATE_COLLECTION",
@@ -34,34 +33,30 @@ class HybridRetriever:
         doc_id: Optional[str] = None,
     ) -> Dict[str, List]:
         try:
-            model = _get_embeddings(
-                getattr(Config, "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-            )
-            query_vector = model.embed_query(query)
-
-            semantic_results = self.db.semantic_search(
-                query_vector=query_vector,
-                collection_name=self.collection_name,
-                limit=semantic_limit,
-            )
-
-            keyword_results = self.db.keyword_search(
+            # Semantic search: high alpha = vector-weighted
+            semantic_results = self.db.hybrid_search(
                 query=query,
-                collection_name=self.collection_name,
+                limit=semantic_limit,
+                doc_id=doc_id,
+                alpha=0.9,
+            )
+
+            # Keyword search: low alpha = keyword-weighted
+            keyword_results = self.db.hybrid_search(
+                query=query,
                 limit=keyword_limit,
+                doc_id=doc_id,
+                alpha=0.1,
             )
         except Exception:
             logger.exception("Hybrid retrieval failed for query=%r", query)
             raise
-
-        # Filter by doc_id if provided (cross_doc=False path)
-        if doc_id:
-            semantic_results = [r for r in semantic_results if r.properties.get("doc_id") == doc_id]
-            keyword_results = [r for r in keyword_results if r.properties.get("doc_id") == doc_id]
+        finally:
+            self.db.close()
 
         # Deduplicate keyword results against semantic results by node_id
-        seen_ids = {r.properties.get("node_id") for r in semantic_results}
-        keyword_results = [r for r in keyword_results if r.properties.get("node_id") not in seen_ids]
+        seen_ids = {r.get("node_id") for r in semantic_results}
+        keyword_results = [r for r in keyword_results if r.get("node_id") not in seen_ids]
 
         return {
             "query": query,
@@ -73,4 +68,4 @@ class HybridRetriever:
         try:
             self.db.close()
         except Exception:
-            logger.exception("Failed to close WeaviateClient")
+            logger.exception("Failed to close DocuMindWeaviateClient")
