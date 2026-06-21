@@ -1,8 +1,11 @@
 import os
+import sys
 import shutil
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from config import Config
@@ -49,12 +52,11 @@ VALID_GRAPH_TYPES = {"heading", "paragraph", "table", "image", "figure", "captio
 class QueryRequest(BaseModel):
     query: str
     cross_doc: bool = False
-
+    doc_id: str | None = None
 
 @app.get("/")
 async def root():
     return {"status": "healthy", "message": "DocuMind Graph v2.0 API is running."}
-
 
 @app.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(file: UploadFile = File(...)):
@@ -123,7 +125,7 @@ async def query_pipeline(request: QueryRequest):
     try:
         # 1. Hybrid search
         retriever = HybridRetriever()
-        hybrid_results = retriever.retrieve(query=request.query, cross_doc=request.cross_doc)
+        hybrid_results = retriever.retrieve(query=request.query, doc_id=request.doc_id, cross_doc=request.cross_doc)
 
         # Deduplicate by node_id
         seen: set = set()
@@ -198,6 +200,7 @@ async def query_pipeline(request: QueryRequest):
                 "risks":          fusion.get("risks", []),
                 "warnings":       fusion.get("warnings", []),
                 "limitations":    fusion.get("limitations", []),
+                "edges":          fusion.get("edges", []),
             },
             "risk_level": overall_risk,
             "documents_used": fusion.get("documents_used", []),
@@ -235,6 +238,14 @@ async def get_graph():
     return HTMLResponse(content=html)
 
 
+@app.get("/graph/data")
+async def get_graph_data():
+    """Return raw JSON data of the knowledge graph for the native React frontend."""
+    if kg.node_count == 0:
+        return {"nodes": [], "edges": []}
+    return kg.export_graph()
+
+
 @app.get("/graph/stats")
 async def get_graph_stats():
     return kg.get_stats()
@@ -266,6 +277,17 @@ async def reindex_negative_edges():
         "graph_nodes": kg.node_count,
         "graph_edges": kg.edge_count,
     }
+
+
+@app.get("/document/file/{filename}")
+async def get_document_file(filename: str):
+    file_path = os.path.join(Config.UPLOADS_DIR, filename)
+    if not os.path.exists(file_path):
+        # Try appending .pdf if not provided
+        file_path = os.path.join(Config.UPLOADS_DIR, f"{filename}.pdf")
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(file_path, content_disposition_type="inline")
 
 
 @app.delete("/document/{filename}")

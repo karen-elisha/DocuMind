@@ -174,52 +174,58 @@ class DocuMindWeaviateClient:
 		)
 
 	def upsert_nodes(self, nodes: Iterable[Mapping[str, Any] | SemanticNode]) -> list[str]:
-		"""Insert or replace semantic nodes in Weaviate."""
+		"""Insert or replace semantic nodes in Weaviate using batch for performance."""
 
 		normalized_nodes = [self._normalize_node(node) for node in nodes]
 		if not normalized_nodes:
 			return []
 
-		collection = self._get_collection()
+		# Generate embeddings for all nodes that don't have one
 		embeddings_to_generate = [node.content for node in normalized_nodes if node.embedding is None]
 		generated_embeddings: list[list[float]] = []
 		if embeddings_to_generate:
 			generated_embeddings = self._embed_texts(embeddings_to_generate)
 
-		generated_index = 0
+		# Pair each node with its embedding
+		paired: list[tuple[SemanticNode, list[float]]] = []
+		gen_idx = 0
+		for node in normalized_nodes:
+			if node.embedding is not None:
+				paired.append((node, list(node.embedding)))
+			else:
+				paired.append((node, generated_embeddings[gen_idx]))
+				gen_idx += 1
+
+		collection = self._get_collection()
 		stored_ids: list[str] = []
 
-		for node in normalized_nodes:
-			embedding = node.embedding
-			if embedding is None:
-				embedding = generated_embeddings[generated_index]
-				generated_index += 1
-
-			properties = {
-				"node_id": node.node_id,
-				"doc_id": node.doc_id,
-				"page": node.page,
-				"section": node.section,
-				"type": node.type,
-				"content": node.content,
-			}
-
-			object_id = self._node_uuid(node)
-
-			if collection.data.exists(object_id):
-				collection.data.replace(
-					uuid=object_id,
+		# Use Weaviate batch insert — one round-trip for all nodes instead of N
+		with collection.batch.fixed_size(batch_size=100) as batch:
+			for node, embedding in paired:
+				object_id = self._node_uuid(node)
+				properties = {
+					"node_id": node.node_id,
+					"doc_id": node.doc_id,
+					"page": node.page,
+					"section": node.section,
+					"type": node.type,
+					"content": node.content,
+				}
+				batch.add_object(
 					properties=properties,
-					vector=list(embedding),
+					vector=embedding,
+					uuid=object_id,
 				)
 				stored_ids.append(str(object_id))
-			else:
-				result = collection.data.insert(
-					properties=properties,
-					vector=list(embedding),
-					uuid=object_id,
-				)
-				stored_ids.append(str(result))
+
+		# Surface any per-object errors from the batch
+		failed = collection.batch.failed_objects
+		if failed:
+			import logging
+			logger = logging.getLogger(__name__)
+			logger.warning("Batch upsert: %d objects failed to insert.", len(failed))
+			for fo in failed[:5]:
+				logger.warning("  Failed object: %s", fo)
 
 		return stored_ids
 

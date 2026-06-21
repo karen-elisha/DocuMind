@@ -131,6 +131,12 @@ def fuse_evidence(
         neg_risk_nodes,
     )
 
+    # ── Edges from traversal paths ────────────────────────────────────
+    edges: List[Dict[str, Any]] = (
+        positive_expansion.get("traversal_paths", []) +
+        negative_expansion.get("traversal_paths", [])
+    )
+
     return {
         "supporting": supporting,
         "exceptions": exceptions,
@@ -138,6 +144,7 @@ def fuse_evidence(
         "risks": risks,
         "warnings": warnings,
         "limitations": limitations,
+        "edges": edges,
         "overall_risk_level": negative_expansion.get("overall_risk_level", "None"),
         "seed_node_ids": seed_node_ids,
         "cross_doc": cross_doc,

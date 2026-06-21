@@ -1,0 +1,801 @@
+import streamlit as st
+import requests
+import html
+import os
+from typing import Dict, Any
+
+API_URL = "http://localhost:8000"
+
+st.set_page_config(
+    page_title="DocuMind Workspace",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "docs_ingested" not in st.session_state:
+    st.session_state.docs_ingested = []
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
+if "show_graph" not in st.session_state:
+    st.session_state.show_graph = False
+
+# ── Dynamic Theme CSS ─────────────────────────────────────────────────────────
+
+is_light = st.session_state.theme == "light"
+
+css_vars = f"""
+    :root {{
+        --bg-color: {'#FAFAFA' if is_light else '#0B0F14'};
+        --panel-bg: {'#FFFFFF' if is_light else '#111827'};
+        --border-color: {'rgba(0,0,0,0.06)' if is_light else 'rgba(255,255,255,0.06)'};
+        --text-primary: {'#111827' if is_light else '#F9FAFB'};
+        --text-secondary: {'#6B7280' if is_light else '#9CA3AF'};
+        --accent: {'#16A34A' if is_light else '#22C55E'};
+        --hover-bg: {'rgba(0,0,0,0.03)' if is_light else 'rgba(255,255,255,0.03)'};
+        --danger: {'#EF4444' if is_light else '#F87171'};
+        --danger-hover: {'#FEE2E2' if is_light else 'rgba(248, 113, 113, 0.1)'};
+        --warning: {'#F59E0B' if is_light else '#FBBF24'};
+        --warning-bg: {'rgba(245, 158, 11, 0.1)' if is_light else 'rgba(251, 191, 36, 0.1)'};
+    }}
+"""
+
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+{css_vars}
+
+html, body, [class*="css"] {{
+    font-family: 'Inter', sans-serif;
+    background-color: var(--bg-color) !important;
+    color: var(--text-primary) !important;
+}}
+
+.stApp {{
+    background-color: var(--bg-color) !important;
+}}
+
+[data-testid="stAppViewContainer"],
+[data-testid="stHeader"] {{
+    background-color: var(--bg-color) !important;
+}}
+
+/* Hide Streamlit components */
+#MainMenu, footer, header {{ visibility: hidden; }}
+[data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"], [data-testid="stSidebar"] {{ display: none !important; }}
+
+.block-container {{ 
+    padding: 1.5rem 2rem 4rem !important; 
+    max-width: 1600px; 
+}}
+
+/* ── Typography & Headers ──────────────────────── */
+h1, h2, h3, h4, h5, h6, p, span, div, label {{ color: var(--text-primary) !important; }}
+h1, h2, h3, h4, h5, h6 {{ font-weight: 600 !important; letter-spacing: -0.02em; }}
+p {{ line-height: 1.6; }}
+
+/* ── Buttons ───────────────────────────────────── */
+.stButton > button {{
+    background-color: var(--panel-bg) !important;
+    color: var(--text-primary) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 12px !important;
+    font-weight: 600 !important;
+    transition: all 0.2s ease !important;
+    padding: 0.6rem 1rem !important;
+    width: 100% !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+}}
+
+.stButton > button:hover {{
+    border-color: var(--accent) !important;
+    background-color: var(--hover-bg) !important;
+    transform: translateY(-1px);
+}}
+
+.btn-primary > div > button {{ 
+    background-color: var(--accent) !important; 
+    color: #FFFFFF !important; 
+    border-color: var(--accent) !important; 
+}}
+.btn-primary > div > button:hover {{ 
+    opacity: 0.9; 
+    background-color: var(--accent) !important;
+}}
+
+.btn-danger > div > button {{ 
+    background-color: transparent !important; 
+    color: var(--danger) !important; 
+    border-color: var(--danger) !important; 
+}}
+.btn-danger > div > button:hover {{ 
+    background-color: var(--danger-hover) !important; 
+}}
+
+.btn-secondary > div > button {{
+    background-color: transparent !important;
+    color: var(--text-secondary) !important;
+    border-color: var(--border-color) !important;
+}}
+.btn-secondary > div > button:hover {{
+    background-color: var(--hover-bg) !important;
+    color: var(--text-primary) !important;
+}}
+
+.studio-btn > div > button {{
+    background-color: var(--panel-bg) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 16px !important;
+    padding: 1rem 1.25rem !important;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 1rem;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+    font-size: 0.95rem;
+    font-weight: 600;
+}}
+.studio-btn > div > button:hover {{
+    transform: translateY(-2px) scale(1.01) !important;
+    box-shadow: 0 8px 16px rgba(0,0,0,0.06) !important;
+    border-color: var(--accent) !important;
+    background: linear-gradient(145deg, var(--panel-bg), var(--hover-bg)) !important;
+}}
+
+/* ── Inputs & Uploader ─────────────────────────── */
+[data-testid="stFileUploader"] {{
+    background-color: var(--panel-bg) !important;
+    border: 1px dashed var(--border-color) !important;
+    border-radius: 16px !important;
+    padding: 1.5rem !important;
+    transition: all 0.2s ease;
+}}
+[data-testid="stFileUploader"]:hover {{
+    border-color: var(--accent) !important;
+}}
+[data-testid="stFileUploader"] section {{
+    background-color: transparent !important;
+}}
+
+[data-testid="stChatInput"] {{
+    background-color: var(--panel-bg) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 16px !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08) !important;
+    padding: 0.5rem !important;
+}}
+[data-testid="stChatInput"]:focus-within {{
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 1px var(--accent) !important;
+}}
+
+/* ── Selectboxes & Toggles ─────────────────────── */
+[data-testid="stSelectbox"] > div > div {{
+    background-color: var(--panel-bg) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 12px !important;
+}}
+
+[data-testid="stToggle"] label span {{
+    font-weight: 500 !important;
+    color: var(--text-secondary) !important;
+}}
+
+/* ── Expanders ─────────────────────────────────── */
+[data-testid="stExpander"] {{
+    background-color: var(--panel-bg) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 16px !important;
+    margin-bottom: 1rem;
+    overflow: hidden;
+}}
+[data-testid="stExpander"] summary {{
+    font-weight: 600 !important;
+    background-color: var(--panel-bg) !important;
+    padding: 1.25rem !important;
+}}
+[data-testid="stExpander"] > details > div {{
+    background-color: var(--panel-bg) !important;
+    border-top: 1px solid var(--border-color) !important;
+    padding: 1.25rem !important;
+}}
+
+/* ── Metric Cards ──────────────────────────────── */
+[data-testid="stMetric"] {{
+    background-color: var(--panel-bg) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: 12px !important;
+    padding: 1rem 1.25rem;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+}}
+[data-testid="stMetric"] label {{
+    color: var(--text-secondary) !important;
+    font-size: 0.75rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}}
+[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+    font-size: 1.5rem !important;
+    font-weight: 700 !important;
+    color: var(--text-primary) !important;
+}}
+
+/* ── Custom UI Elements ────────────────────────── */
+.top-nav {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 0;
+    margin-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+}}
+.nav-logo-area {{
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}}
+.nav-logo {{
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}}
+.nav-logo span {{
+    color: var(--accent) !important;
+}}
+
+.status-pill {{
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    letter-spacing: 0.05em;
+    border: 1px solid var(--border-color);
+}}
+.status-pill.online {{ 
+    background-color: rgba(34, 197, 94, 0.1); 
+    color: var(--accent) !important; 
+    border-color: rgba(34, 197, 94, 0.2);
+}}
+.status-pill.offline {{ 
+    background-color: rgba(239, 68, 68, 0.1); 
+    color: var(--danger) !important; 
+    border-color: rgba(239, 68, 68, 0.2);
+}}
+
+.panel-container {{
+    background-color: transparent;
+    height: 100%;
+}}
+
+.source-card {{
+    background-color: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: all 0.2s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+}}
+.source-card:hover {{
+    transform: translateY(-2px);
+    box-shadow: 0 4px 6px rgba(0,0,0,0.04);
+    border-color: var(--accent);
+}}
+.source-info {{
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}}
+.source-name {{
+    font-weight: 600;
+    font-size: 0.875rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+.source-meta {{
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-top: 0.25rem;
+}}
+
+.chat-message-user {{
+    background-color: var(--hover-bg);
+    color: var(--text-primary);
+    border-radius: 16px;
+    border-bottom-right-radius: 4px;
+    padding: 1rem 1.25rem;
+    max-width: 80%;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+    word-break: break-word;
+}}
+.chat-message-assistant {{
+    background-color: var(--panel-bg);
+    color: var(--text-primary);
+    border-radius: 16px;
+    border-bottom-left-radius: 4px;
+    padding: 1.25rem;
+    max-width: 95%;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.04);
+    word-break: break-word;
+}}
+
+.evidence-card {{
+    background-color: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+    transition: all 0.2s ease;
+}}
+.evidence-card:hover {{
+    background-color: var(--hover-bg);
+}}
+.evidence-card.risk {{ border-left: 4px solid var(--danger); }}
+.evidence-card.safe {{ border-left: 4px solid var(--accent); }}
+
+.ev-tag {{
+    background-color: var(--bg-color);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary) !important;
+    font-weight: 600;
+    padding: 0.15rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.65rem;
+    margin-right: 0.5rem;
+    text-transform: uppercase;
+}}
+
+.risk-pill {{
+    display: inline-flex;
+    align-items: center;
+    font-weight: 600;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    margin-right: 0.5rem;
+    text-transform: uppercase;
+    border: 1px solid;
+}}
+.risk-pill.high {{ background-color: rgba(239, 68, 68, 0.1); color: var(--danger) !important; border-color: rgba(239, 68, 68, 0.2); }}
+.risk-pill.medium {{ background-color: rgba(245, 158, 11, 0.1); color: var(--warning) !important; border-color: rgba(245, 158, 11, 0.2); }}
+.risk-pill.low {{ background-color: rgba(34, 197, 94, 0.1); color: var(--accent) !important; border-color: rgba(34, 197, 94, 0.2); }}
+.risk-pill.none {{ background-color: var(--hover-bg); color: var(--text-secondary) !important; border-color: var(--border-color); }}
+
+.conf-bar-container {{
+    margin-top: 0.5rem;
+}}
+.conf-label {{
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-secondary) !important;
+    margin-bottom: 0.35rem;
+    letter-spacing: 0.05em;
+}}
+.conf-bar {{
+    height: 4px;
+    background-color: var(--border-color);
+    border-radius: 9999px;
+    overflow: hidden;
+}}
+.conf-fill {{
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 0.5s ease-in-out;
+}}
+
+hr {{ border-top: 1px solid var(--border-color) !important; opacity: 1 !important; margin: 2rem 0; }}
+
+.section-title {{
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-secondary) !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 1rem;
+}}
+.chat-header-meta {{
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 2rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border-color);
+}}
+.chat-header-meta span {{
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def check_backend() -> bool:
+    try:
+        return requests.get(f"{API_URL}/", timeout=2).status_code == 200
+    except Exception:
+        return False
+
+def risk_pill(level: str) -> str:
+    cls = level.lower() if level in ("High", "Medium", "Low") else "none"
+    return f'<span class="risk-pill {cls}">Risk: {level}</span>'
+
+def confidence_meter(score: float) -> str:
+    pct = int(score * 100)
+    if pct >= 80: color = "var(--accent)"
+    elif pct >= 50: color = "var(--warning)"
+    else: color = "var(--danger)"
+    
+    return f"""
+    <div class="conf-bar-container">
+        <div class="conf-label">CONFIDENCE: {pct}%</div>
+        <div class="conf-bar">
+            <div class="conf-fill" style="width:{pct}%; background-color:{color};"></div>
+        </div>
+    </div>
+    """
+
+def render_ev_card(node: Dict, is_risk: bool = False) -> str:
+    ntype = str(node.get("type", "node")).upper()
+    page = node.get("page", "?")
+    content = html.escape(html.unescape(str(node.get("content", ""))))[:280]
+    doc_id = node.get("doc_id", "")
+    card_cls = "evidence-card risk" if is_risk else "evidence-card safe"
+    doc_str = f" • DOC: {html.escape(doc_id)}" if doc_id else ""
+    return f"""
+    <div class="{card_cls}">
+        <div style="margin-bottom: 0.5rem; display: flex; align-items: center;">
+            <span class="ev-tag">{ntype}</span>
+            <span style="font-size:0.7rem; color: var(--text-secondary); font-weight: 500;">PAGE {page}{doc_str}</span>
+        </div>
+        <div style="font-size: 0.875rem; line-height: 1.5; color: var(--text-primary);">{content}</div>
+    </div>"""
+
+def render_explainability(evidence: Dict, risk: str, conf: float, data: Dict) -> None:
+    supporting     = evidence.get("supporting", [])
+    exceptions     = evidence.get("exceptions", [])
+    contradictions = evidence.get("contradictions", [])
+    risks_ev       = evidence.get("risks", [])
+    warnings       = evidence.get("warnings", [])
+    limitations    = evidence.get("limitations", [])
+    all_risk_nodes = exceptions + contradictions + risks_ev + warnings + limitations
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Confidence", f"{int(conf*100)}%")
+    m2.metric("Supporting", len(supporting))
+    m3.metric("Exceptions", len(all_risk_nodes))
+    m4.metric("Risk Level", risk or "NONE")
+
+    st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
+
+    if supporting:
+        st.markdown("<div class='section-title' style='margin-top:0;'>Supporting Evidence</div>", unsafe_allow_html=True)
+        for node in supporting[:6]:
+            st.markdown(render_ev_card(node), unsafe_allow_html=True)
+
+    if all_risk_nodes:
+        st.markdown("<div class='section-title' style='margin-top:1.5rem;'>Exceptions & Risks</div>", unsafe_allow_html=True)
+        for node in all_risk_nodes[:5]:
+            st.markdown(render_ev_card(node, is_risk=True), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if conf >= 0.85:
+        st.success(f"High Confidence ({int(conf*100)}%) — Strong evidence found.")
+    elif conf >= 0.65:
+        st.warning(f"Medium Confidence ({int(conf*100)}%) — Qualified by some exceptions.")
+    else:
+        st.error(f"Low Confidence ({int(conf*100)}%) — Significant risks or contradictions detected.")
+
+
+# ── Components ────────────────────────────────────────────────────────────────
+def render_navbar():
+    backend_ok = check_backend()
+    status_html = '<span class="status-pill online">● API Online</span>' if backend_ok else '<span class="status-pill offline">● API Offline</span>'
+    
+    st.markdown(f"""
+    <div class="top-nav">
+        <div class="nav-logo-area">
+            <div class="nav-logo">Docu<span>Mind</span></div>
+            <div>{status_html}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Place theme toggle in a container that aligns right and floats up
+    col1, col2 = st.columns([8, 1])
+    with col2:
+        st.markdown("<div style='margin-top: -4.5rem; display: flex; justify-content: flex-end;'>", unsafe_allow_html=True)
+        theme_toggle = st.toggle("Dark Theme", value=(st.session_state.theme == "dark"))
+        new_theme = "dark" if theme_toggle else "light"
+        if new_theme != st.session_state.theme:
+            st.session_state.theme = new_theme
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+def render_sources_panel():
+    st.markdown("<div class='panel-container'>", unsafe_allow_html=True)
+    
+    st.markdown("""
+        <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;'>
+            <h3 style='margin: 0;'>Sources</h3>
+            <div style='background: var(--hover-bg); padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600;'>
+                %d Docs
+            </div>
+        </div>
+    """ % len(st.session_state.docs_ingested), unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader("Drop files here", type=["pdf", "docx"], label_visibility="collapsed")
+    st.markdown('<div class="btn-primary" style="margin-top: 1rem; margin-bottom: 2rem;">', unsafe_allow_html=True)
+    if st.button("Add Source"):
+        if uploaded_file:
+            with st.spinner("Ingesting..."):
+                try:
+                    response = requests.post(
+                        f"{API_URL}/upload",
+                        files={"file": (uploaded_file.name, uploaded_file, uploaded_file.type)},
+                        timeout=300,
+                    )
+                    if response.status_code in (200, 201):
+                        data = response.json()
+                        if uploaded_file.name not in st.session_state.docs_ingested:
+                            st.session_state.docs_ingested.append(uploaded_file.name)
+                        st.success(f"Added {data.get('graph_nodes', '?')} nodes")
+                    else:
+                        st.error("Upload Failed.")
+                except Exception:
+                    st.error("API Unavailable.")
+        else:
+            st.warning("Please select a file.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.docs_ingested:
+        st.markdown("<div class='section-title'>Library</div>", unsafe_allow_html=True)
+        for i, doc in enumerate(st.session_state.docs_ingested):
+            col_doc, col_del = st.columns([4, 1])
+            with col_doc:
+                st.markdown(f"""
+                <div class="source-card">
+                    <div class="source-info">
+                        <div class="source-name">📄 {html.escape(doc)}</div>
+                        <div class="source-meta">Ingested successfully</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col_del:
+                st.markdown('<div class="btn-secondary" style="margin-top: 0.2rem;">', unsafe_allow_html=True)
+                if st.button("✕", key=f"del_{i}", help="Delete source"):
+                    try:
+                        requests.delete(f"{API_URL}/document/{doc}", timeout=5)
+                    except Exception:
+                        pass
+                    st.session_state.docs_ingested.pop(i)
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def render_message(msg):
+    if msg["role"] == "user":
+        st.markdown(f"""
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 1rem;">
+            <div class="chat-message-user">
+                {html.unescape(msg["content"])}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="display: flex; justify-content: flex-start; margin-bottom: 0.5rem;">
+            <div class="chat-message-assistant">
+                <div style="margin-bottom: 1rem;">{html.unescape(msg["content"])}</div>
+        """, unsafe_allow_html=True)
+        
+        if "meta" in msg:
+            meta = msg["meta"]
+            risk = meta.get("risk_level", "None")
+            conf = meta.get("confidence_score", 0.0)
+            evidence = meta.get("evidence", {})
+
+            st.markdown(f"""
+            <div style="display: flex; justify-content: flex-start; align-items: center; margin-bottom: 0.5rem; gap: 1rem;">
+                {risk_pill(risk)}
+                <div style="width: 150px;">{confidence_meter(conf)}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.session_state.get('show_evidence', True):
+                st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
+                with st.expander("View Evidence & Citations"):
+                    render_explainability(evidence, risk, conf, meta)
+                    
+        st.markdown("</div></div>", unsafe_allow_html=True)
+
+def render_chat_panel():
+    # Header
+    st.markdown("""
+        <h2 style='margin-bottom: 0.5rem;'>Research Notebook</h2>
+    """, unsafe_allow_html=True)
+    
+    st.markdown(f"""
+        <div class="chat-header-meta">
+            <span>📚 {len(st.session_state.docs_ingested)} Sources</span>
+            <span>•</span>
+            <span>⏱️ Active Session</span>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Main Chat Area
+    chat_container = st.container()
+    
+    with chat_container:
+        if not st.session_state.messages and not st.session_state.docs_ingested:
+            st.markdown("""
+            <div style="text-align:center; padding: 6rem 2rem; color: var(--text-secondary);">
+                <div style="font-size: 3rem; margin-bottom: 1rem; opacity: 0.5;">✨</div>
+                <h3 style="margin-bottom: 0.5rem; color: var(--text-primary) !important;">No sources added yet</h3>
+                <p>Upload documents to begin querying your knowledge base</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            for msg in st.session_state.messages:
+                render_message(msg)
+                
+    # Show Knowledge Graph inline if activated from Studio
+    if st.session_state.show_graph:
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown("<h3>Knowledge Graph Visualization</h3>", unsafe_allow_html=True)
+        with st.spinner("Building Visualization..."):
+            try:
+                r = requests.get(f"{API_URL}/graph", timeout=15)
+                if r.status_code == 200:
+                    st.components.v1.html(r.text, height=600)
+                else:
+                    st.error("Failed to load graph.")
+            except Exception:
+                st.error("API Unavailable.")
+        
+        st.markdown('<div class="btn-secondary" style="width: 200px;">', unsafe_allow_html=True)
+        if st.button("Close Graph"):
+            st.session_state.show_graph = False
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<div style='height: 100px;'></div>", unsafe_allow_html=True) # Bottom padding for sticky input
+
+    # Sticky Bottom Input
+    if query := st.chat_input("Ask your documents anything..."):
+        st.session_state.messages.append({"role": "user", "content": query})
+        with chat_container:
+            render_message({"role": "user", "content": query})
+
+            with st.spinner("Synthesizing..."):
+                try:
+                    active_doc = st.session_state.get('active_doc_setting')
+                    active_doc_id = os.path.splitext(active_doc)[0] if active_doc else None
+                    cross_doc = st.session_state.get('cross_doc_setting', False)
+
+                    response = requests.post(
+                        f"{API_URL}/query",
+                        json={"query": query, "cross_doc": cross_doc, "doc_id": active_doc_id},
+                        timeout=60,
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        answer = html.unescape(data.get("answer") or data.get("response", "No answer returned."))
+                        
+                        msg_data = {
+                            "role": "assistant",
+                            "content": answer,
+                            "meta": data,
+                        }
+                        
+                        st.session_state.messages.append(msg_data)
+                        st.rerun()
+                    else:
+                        st.error(f"Query Failed: {response.text}")
+                except Exception:
+                    st.error("API Unavailable. Start backend first.")
+
+def render_graph_metrics():
+    st.markdown("<div class='section-title' style='margin-top: 2rem;'>Graph Metrics</div>", unsafe_allow_html=True)
+    try:
+        stats = requests.get(f"{API_URL}/graph/stats", timeout=3).json()
+    except Exception:
+        stats = {}
+
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("Total Nodes", stats.get("total_nodes", "—"))
+        st.metric("Positive Edges", stats.get("positive_edges", "—"))
+    with m2:
+        st.metric("Total Edges", stats.get("total_edges", "—"))
+        st.metric("Negative Edges", stats.get("negative_edges", "—"))
+
+def render_studio_panel():
+    st.markdown("<div class='panel-container'>", unsafe_allow_html=True)
+    st.markdown("<h3 style='margin-bottom: 1.5rem; margin-top: 0;'>Studio</h3>", unsafe_allow_html=True)
+
+    # Action Cards
+    st.markdown('<div class="studio-btn">', unsafe_allow_html=True)
+    if st.button("🕸️ Knowledge Graph", use_container_width=True):
+        st.session_state.show_graph = True
+        st.rerun()
+    st.button("📝 Summary", use_container_width=True, disabled=True)
+    st.button("🎧 Audio Overview", use_container_width=True, disabled=True)
+    st.button("🗂️ Flashcards", use_container_width=True, disabled=True)
+    st.button("❓ Quiz Generator", use_container_width=True, disabled=True)
+    st.button("📊 Reports", use_container_width=True, disabled=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    render_graph_metrics()
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>Settings</div>", unsafe_allow_html=True)
+    
+    if st.session_state.docs_ingested:
+        st.session_state['active_doc_setting'] = st.selectbox("Target Document", st.session_state.docs_ingested, index=len(st.session_state.docs_ingested)-1)
+    
+    st.session_state['cross_doc_setting'] = st.toggle("Cross-Document QA", value=False)
+    st.session_state['show_evidence'] = st.toggle("Show Evidence", value=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    col_clear, col_reset = st.columns(2)
+    with col_clear:
+        st.markdown('<div class="btn-secondary">', unsafe_allow_html=True)
+        if st.button("Clear Chat"):
+            st.session_state.messages = []
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+    with col_reset:
+        st.markdown('<div class="btn-danger">', unsafe_allow_html=True)
+        if st.button("Reset All"):
+            with st.spinner("Clearing data..."):
+                try:
+                    r = requests.post(f"{API_URL}/reset", timeout=30)
+                    if r.status_code == 200:
+                        st.session_state.docs_ingested = []
+                        st.session_state.messages = []
+                        st.session_state.show_graph = False
+                        st.success("Cleared")
+                        st.rerun()
+                    else:
+                        st.error("Failed")
+                except Exception:
+                    st.error("Failed")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ── App Layout ────────────────────────────────────────────────────────────────
+render_navbar()
+
+col_sources, col_chat, col_studio = st.columns([1.2, 2.6, 1.2], gap="large")
+
+with col_sources:
+    render_sources_panel()
+
+with col_chat:
+    render_chat_panel()
+
+with col_studio:
+    render_studio_panel()

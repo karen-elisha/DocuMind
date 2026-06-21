@@ -7,7 +7,7 @@ sys.stderr.reconfigure(encoding='utf-8')
 
 from ingestion.parser import parse_document
 
-pdf_path = r"C:\Users\tharu\OneDrive\Desktop\Dell\data\uploads\NIPS-2017-attention-is-all-you-need-Paper (1).pdf"
+pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploads", "NIPS-2017-attention-is-all-you-need-Paper (1).pdf")
 parse_result = parse_document(file_path=pdf_path, doc_id="NIPS-2017-attention-is-all-you-need-Paper")
 
 print("\n" + "=" * 70)
