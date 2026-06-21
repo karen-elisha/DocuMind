@@ -1,5 +1,3 @@
-# retrieval/hybrid_search.py
-
 import logging
 from typing import Dict, List, Optional
 
@@ -10,51 +8,35 @@ logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
-    """
-    Hybrid Retrieval:
-    1. Semantic Search (vector)
-    2. Keyword Search (BM25)
-    3. Return both result sets for Evidence Fusion layer
-    """
-
     def __init__(self):
         self.db = DocuMindWeaviateClient()
-        self.collection_name = getattr(
-            Config,
-            "WEAVIATE_COLLECTION",
-            "DocumentNode",
-        )
+        self.collection_name = getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
 
     def retrieve(
         self,
         query: str,
-        semantic_limit: int = 10,
-        keyword_limit: int = 10,
+        semantic_limit: int = 50,
+        keyword_limit: int = 50,
         doc_id: Optional[str] = None,
         cross_doc: bool = False,
     ) -> Dict[str, List]:
-        """
-        cross_doc=False → filter by doc_id (single-document retrieval)
-        cross_doc=True  → no doc_id filter (search across all indexed documents)
-        """
-        # cross_doc=True overrides doc_id filter
         filter_doc_id = None if cross_doc else doc_id
 
         try:
-            # Semantic search: high alpha = vector-weighted
+            # Pure vector search (alpha=1.0) — semantic similarity
             semantic_results = self.db.hybrid_search(
                 query=query,
                 limit=semantic_limit,
                 doc_id=filter_doc_id,
-                alpha=0.9,
+                alpha=1.0,
             )
 
-            # Keyword search: low alpha = keyword-weighted
+            # Pure BM25 keyword search (alpha=0.0) — lexical match
             keyword_results = self.db.hybrid_search(
                 query=query,
                 limit=keyword_limit,
                 doc_id=filter_doc_id,
-                alpha=0.1,
+                alpha=0.0,
             )
         except Exception:
             logger.exception("Hybrid retrieval failed for query=%r", query)
@@ -62,9 +44,22 @@ class HybridRetriever:
         finally:
             self.db.close()
 
-        # Deduplicate keyword results against semantic results by node_id
         seen_ids = {r.get("node_id") for r in semantic_results}
         keyword_results = [r for r in keyword_results if r.get("node_id") not in seen_ids]
+
+        # Fallback: if both searches returned empty, fetch all nodes for the doc
+        all_results_list = semantic_results + keyword_results
+        if not all_results_list and not cross_doc and doc_id is not None:
+            logger.info("Both searches returned empty for query=%r — fetching all nodes for doc_id=%s", query, doc_id)
+            try:
+                fallback_results = self.db.fetch_all(doc_id=doc_id, limit=50)
+                semantic_results = fallback_results
+            except Exception as fallback_exc:
+                logger.warning("Fallback fetch_all failed: %s", fallback_exc)
+
+        # Combine and sort by score descending
+        combined = semantic_results + keyword_results
+        combined.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         return {
             "query": query,

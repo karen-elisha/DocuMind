@@ -68,7 +68,10 @@ def parse_document_pymupdf(
 
     Returns the same schema as the Docling parser so it is a drop-in replacement.
     """
-    import fitz  # PyMuPDF
+    try:
+        import fitz as _fitz_mod  # PyMuPDF
+    except ImportError:
+        import pymupdf as _fitz_mod  # fallback
 
     timings: Dict[str, float] = {} if _timing is None else _timing
 
@@ -79,7 +82,7 @@ def parse_document_pymupdf(
     print(f"[PyMuPDFParser] Opening file: {file_path}")
     t0 = time.perf_counter()
 
-    doc = fitz.open(file_path)
+    doc = _fitz_mod.open(file_path)
     num_pages = len(doc)
     print(f"[PyMuPDFParser] Pages: {num_pages}")
 
@@ -97,7 +100,7 @@ def parse_document_pymupdf(
 
         # ── Text blocks ───────────────────────────────────────────────────────
         # Get all text blocks with font information
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+        blocks = page.get_text("dict", flags=_fitz_mod.TEXT_PRESERVE_WHITESPACE)["blocks"]
 
         # Collect all font sizes on this page to compute median body size
         all_sizes: List[float] = []

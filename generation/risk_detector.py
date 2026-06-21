@@ -89,4 +89,30 @@ def score_nodes(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def confidence_from_risk(risk_level: str) -> float:
     """Map risk level to a confidence adjustment factor (0–1)."""
-    return {"None": 1.0, "Low": 0.92, "Medium": 0.75, "High": 0.55}.get(risk_level, 0.75)
+    return {"None": 0.95, "Low": 0.85, "Medium": 0.70, "High": 0.45}.get(risk_level, 0.70)
+
+
+def calculate_confidence(
+    risk_level: str,
+    avg_retrieval_score: float = 0.5,
+    support_count: int = 0,
+    contradiction_count: int = 0,
+    has_media: bool = False,
+) -> float:
+    """
+    Calculate a nuanced confidence score considering:
+    - Risk level (baseline)
+    - Average retrieval similarity score
+    - Number of supporting evidence items
+    - Contradictions/risks present
+    - Media (image/table) presence bonus
+    """
+    base = confidence_from_risk(risk_level)
+
+    retrieval_factor = 0.3 + 0.7 * max(0.0, min(avg_retrieval_score, 1.0))
+    support_factor = min(support_count / 5.0, 1.0)
+    contradiction_penalty = max(0.0, 1.0 - 0.12 * contradiction_count)
+    media_bonus = 0.04 if has_media else 0.0
+
+    confidence = base * retrieval_factor * (0.5 + 0.5 * support_factor) * contradiction_penalty + media_bonus
+    return max(0.12, min(confidence, 0.97))

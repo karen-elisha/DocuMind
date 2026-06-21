@@ -118,13 +118,18 @@ def _merge_short_nodes(nodes: List[Node]) -> List[Node]:
 _embeddings_instance = None
 
 
-def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
+def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings | None:
     global _embeddings_instance
     if _embeddings_instance is None:
         print(f"[Embeddings] Loading model: {model_name}")
         t0 = time.perf_counter()
-        _embeddings_instance = HuggingFaceEmbeddings(model_name=model_name)
-        print(f"[Embeddings] Model loaded in {time.perf_counter()-t0:.2f}s")
+        try:
+            _embeddings_instance = HuggingFaceEmbeddings(model_name=model_name)
+            print(f"[Embeddings] Model loaded in {time.perf_counter()-t0:.2f}s")
+        except Exception as exc:
+            print(f"[Embeddings] FAILED to load model: {exc}")
+            print("[Embeddings] Continuing without local embeddings. Weaviate will use its own vectorizer or keyword search.")
+            _embeddings_instance = None  # sentinel so we don't retry
     return _embeddings_instance
 
 
@@ -171,12 +176,23 @@ def build_nodes(
 
         if el_type == "image":
             summary = ""
+            fig_num = metadata.get("figure_number", "")
+            fig_cap = metadata.get("figure_caption", "") or metadata.get("caption", "")
             for v in vision_results.values():
                 if int(v.get("page") or 1) == page and v.get("vision_summary"):
                     summary = v["vision_summary"]
                     break
-            node.content = summary.strip() if summary else ""
+            # Build content: prefix with [Figure N] for keyword search, then vision or caption
+            prefix = f"[Figure {fig_num}] " if fig_num else ""
+            if summary.strip():
+                node.content = f"{prefix}{summary.strip()}"
+            elif fig_cap:
+                node.content = f"{prefix}{fig_cap}"
+            else:
+                node.content = f"{prefix}image on page {page}".strip() if prefix else f"image on page {page}"
             node.metadata["image_vision_available"] = bool(summary)
+            node.metadata["figure_number"] = fig_num
+            node.metadata["figure_caption"] = fig_cap
 
         if el_type == "caption":
             node.metadata.setdefault("links_to_image", True)
@@ -193,18 +209,29 @@ def build_nodes(
         img_path = img.get("image_path")
         page = _safe_int(img.get("page"), 1)
         summary = image_summaries_by_path.get(img_path, "")
+        fig_num = img.get("figure_number", "")
+        fig_cap = img.get("caption", "")
         if not any(n.type == "image" and n.page == page and (n.metadata.get("image_path") == img_path) for n in nodes):
+            prefix = f"[Figure {fig_num}] " if fig_num else ""
+            if summary.strip():
+                content = f"{prefix}{summary.strip()}"
+            elif fig_cap:
+                content = f"{prefix}{fig_cap}"
+            else:
+                content = f"{prefix}image on page {page}".strip() if prefix else f"image on page {page}"
             nodes.append(
                 Node(
                     node_id=_node_id("image"),
                     doc_id=doc_id,
                     page=page,
                     type="image",
-                    content=(summary or "").strip(),
+                    content=content,
                     metadata={
                         "image_path": img_path,
                         "source": "docling_export_to_images",
                         "vision_summary_available": bool(summary),
+                        "figure_number": fig_num,
+                        "figure_caption": fig_cap,
                     },
                 )
             )
@@ -359,6 +386,10 @@ def embed_chunks(
 
     embeddings = _get_embeddings(embedding_model_name)
 
+    if embeddings is None:
+        print("[Embeddings] Skipping embedding generation (model unavailable)")
+        return {**chunked, "embedded": False}
+
     texts = [c["content"] for c in chunks]
     vectors = embeddings.embed_documents(texts)
 
@@ -449,17 +480,26 @@ def run_ingestion_pipeline(
 
     stored = {"stored": False, "count": 0}
     if enable_embeddings:
-        with Timer("Embeddings") as t:
-            embedded = embed_chunks(chunked)
-        timings["embeddings"] = t.elapsed
+        try:
+            with Timer("Embeddings") as t:
+                embedded = embed_chunks(chunked)
+            timings["embeddings"] = t.elapsed
+        except Exception as exc:
+            print(f"[Pipeline] Embeddings failed with exception: {exc}")
+            embedded = {**chunked, "embedded": False}
+            timings["embeddings"] = 0.0
     else:
         embedded = chunked
         timings["embeddings"] = 0.0
 
     if enable_weaviate:
-        with Timer("Weaviate Storage") as t:
-            stored = store_chunks_weaviate(embedded, collection_name=weaviate_collection)
-        timings["weaviate"] = t.elapsed
+        try:
+            with Timer("Weaviate Storage") as t:
+                stored = store_chunks_weaviate(embedded, collection_name=weaviate_collection)
+            timings["weaviate"] = t.elapsed
+        except Exception as exc:
+            print(f"[Pipeline] Weaviate storage failed with exception: {exc}")
+            timings["weaviate"] = 0.0
     else:
         timings["weaviate"] = 0.0
 

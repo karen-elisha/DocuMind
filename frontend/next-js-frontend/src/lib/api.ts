@@ -74,3 +74,35 @@ export async function resetCollection() {
   }
   return res.json();
 }
+
+export async function getDocumentInsights(docId: string) {
+  const res = await fetch(`${API_URL}/document/${encodeURIComponent(docId)}/insights`);
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+export async function getFigure(docId: string, figureNumber: string) {
+  const res = await fetch(`${API_URL}/document/${encodeURIComponent(docId)}/figure/${encodeURIComponent(figureNumber)}`);
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+export async function getTable(docId: string, tableNumber: string) {
+  const res = await fetch(`${API_URL}/document/${encodeURIComponent(docId)}/table/${encodeURIComponent(tableNumber)}`);
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+export async function listDocuments() {
+  const res = await fetch(`${API_URL}/documents`);
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}

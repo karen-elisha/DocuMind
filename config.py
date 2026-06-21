@@ -32,6 +32,10 @@ class Config:
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 
+    # Docling parser limits
+    MAX_DOCLING_PAGES = int(os.getenv("MAX_DOCLING_PAGES", "30"))
+    DOCLING_TIMEOUT = int(os.getenv("DOCLING_TIMEOUT", "120"))  # seconds
+
     # Feature flags (dev-speed defaults: false)
     ENABLE_VISION = os.getenv("ENABLE_VISION", "false").lower() == "true"
     ENABLE_EMBEDDINGS = os.getenv("ENABLE_EMBEDDINGS", "false").lower() == "true"

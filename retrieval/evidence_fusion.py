@@ -89,20 +89,37 @@ def fuse_evidence(
     )
 
     seen_ids: set = set()
+    seen_hashes: set = set()
     supporting: List[Dict[str, Any]] = []
 
     for node in seed_nodes:
         nid = _get_id(node)
-        if nid and nid not in seen_ids:
+        if nid and nid in seen_ids:
+            continue
+        content = str(node.get("content", "")).strip()
+        chash = hash(content) if content else 0
+        if chash and chash in seen_hashes:
+            continue
+        if nid:
             seen_ids.add(nid)
-            supporting.append(node)
+        if chash:
+            seen_hashes.add(chash)
+        supporting.append(node)
 
     for item in positive_expansion.get("evidence", []):
         node = item["node"]
         nid = _get_id(node)
-        if nid and nid not in seen_ids:
+        if nid and nid in seen_ids:
+            continue
+        content = str(node.get("content", "")).strip()
+        chash = hash(content) if content else 0
+        if chash and chash in seen_hashes:
+            continue
+        if nid:
             seen_ids.add(nid)
-            supporting.append(node)
+        if chash:
+            seen_hashes.add(chash)
+        supporting.append(node)
 
     # ── Seed node IDs (from positive expansion's seed_nodes) ──────────
     seed_node_ids: List[str] = [

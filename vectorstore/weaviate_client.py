@@ -27,6 +27,8 @@ class SemanticNode:
 	section: str
 	type: str
 	content: str
+	figure_number: str = ""
+	table_number: str = ""
 	embedding: Sequence[float] | None = None
 
 
@@ -93,21 +95,29 @@ class DocuMindWeaviateClient:
 
 		existing = client.collections.list_all()
 		if self.collection_name in existing:
+			# Add missing properties (figure_number, table_number) if not present
+			collection = client.collections.get(self.collection_name)
+			existing_props = {p.name for p in collection.config.get().properties}
+			if "figure_number" not in existing_props:
+				collection.config.add_property(wc.Property(name="figure_number", data_type=wc.DataType.TEXT))
+			if "table_number" not in existing_props:
+				collection.config.add_property(wc.Property(name="table_number", data_type=wc.DataType.TEXT))
 			return
 
-
 		client.collections.create(
-			name=self.collection_name,
-			vectorizer_config=wc.Configure.Vectorizer.none(),
-			properties=[
-				wc.Property(name="node_id", data_type=wc.DataType.TEXT),
-				wc.Property(name="doc_id", data_type=wc.DataType.TEXT),
-				wc.Property(name="page", data_type=wc.DataType.INT),
-				wc.Property(name="section", data_type=wc.DataType.TEXT),
-				wc.Property(name="type", data_type=wc.DataType.TEXT),
-				wc.Property(name="content", data_type=wc.DataType.TEXT),
-			],
-		)
+            name=self.collection_name,
+            vectorizer_config=wc.Configure.Vectorizer.none(),
+            properties=[
+                wc.Property(name="node_id", data_type=wc.DataType.TEXT),
+                wc.Property(name="doc_id", data_type=wc.DataType.TEXT),
+                wc.Property(name="page", data_type=wc.DataType.INT),
+                wc.Property(name="section", data_type=wc.DataType.TEXT),
+                wc.Property(name="type", data_type=wc.DataType.TEXT),
+                wc.Property(name="content", data_type=wc.DataType.TEXT),
+                wc.Property(name="figure_number", data_type=wc.DataType.TEXT),
+                wc.Property(name="table_number", data_type=wc.DataType.TEXT),
+            ],
+        )
 
 	def _get_collection(self):
 		self.ensure_schema()
@@ -120,22 +130,34 @@ class DocuMindWeaviateClient:
 		if self._embedder is None:
 			try:
 				from sentence_transformers import SentenceTransformer
-			except ImportError as exc:
-				raise RuntimeError(
-					"sentence-transformers is required for BGE-small-en-v1.5 embeddings."
-				) from exc
+			except Exception as exc:
+				import logging
+				logging.getLogger(__name__).warning("SentenceTransformer import failed: %s", exc)
+				return []
 
-			self._embedder = SentenceTransformer(self.embedding_model)
+			try:
+				self._embedder = SentenceTransformer(self.embedding_model)
+			except Exception as exc:
+				import logging
+				logging.getLogger(__name__).warning("SentenceTransformer failed to load: %s", exc)
+				return []
+
+		if self._embedder is None:
+			return []
 
 		vectors: list[list[float]] = []
 		text_list = list(texts)
 		for start in range(0, len(text_list), batch_size):
 			batch = text_list[start:start + batch_size]
-			embeddings = self._embedder.encode(batch, normalize_embeddings=True)
-			if hasattr(embeddings, "tolist"):
-				vectors.extend([list(vector) for vector in embeddings.tolist()])
-			else:
-				vectors.extend([list(vector) for vector in embeddings])
+			try:
+				embeddings = self._embedder.encode(batch, normalize_embeddings=True)
+				if hasattr(embeddings, "tolist"):
+					vectors.extend([list(vector) for vector in embeddings.tolist()])
+				else:
+					vectors.extend([list(vector) for vector in embeddings])
+			except Exception:
+				# If encoding fails, add zero vectors as fallback
+				vectors.extend([[0.0] * 384 for _ in range(len(batch))])
 
 		return vectors
 
@@ -170,6 +192,8 @@ class DocuMindWeaviateClient:
 			section=str(node.get("section", "")),
 			type=str(required_fields["type"]),
 			content=str(required_fields["content"]),
+			figure_number=str(node.get("figure_number", "") or node.get("metadata", {}).get("figure_number", "")),
+			table_number=str(node.get("table_number", "") or node.get("metadata", {}).get("table_number", "")),
 			embedding=node.get("embedding"),
 		)
 
@@ -186,15 +210,16 @@ class DocuMindWeaviateClient:
 		if embeddings_to_generate:
 			generated_embeddings = self._embed_texts(embeddings_to_generate)
 
-		# Pair each node with its embedding
+		# Pair each node with its embedding (use zero vector if embedding generation failed)
 		paired: list[tuple[SemanticNode, list[float]]] = []
-		gen_idx = 0
 		for node in normalized_nodes:
 			if node.embedding is not None:
 				paired.append((node, list(node.embedding)))
+			elif generated_embeddings:
+				paired.append((node, generated_embeddings.pop(0)))
 			else:
-				paired.append((node, generated_embeddings[gen_idx]))
-				gen_idx += 1
+				# Embedding generation failed — store with zero vector
+				paired.append((node, [0.0] * 384))
 
 		collection = self._get_collection()
 		stored_ids: list[str] = []
@@ -210,6 +235,8 @@ class DocuMindWeaviateClient:
 					"section": node.section,
 					"type": node.type,
 					"content": node.content,
+					"figure_number": node.figure_number,
+					"table_number": node.table_number,
 				}
 				batch.add_object(
 					properties=properties,
@@ -255,16 +282,26 @@ class DocuMindWeaviateClient:
 			for extra_filter in filters[1:]:
 				filter_expression = filter_expression & extra_filter
 
-		query_vector = self._embed_texts([query])[0]
+		query_vectors = self._embed_texts([query])
+		query_vector = query_vectors[0] if query_vectors and len(query_vectors) > 0 else None
 
-		results = collection.query.hybrid(
-			query=query,
-			vector=query_vector,
-			limit=limit,
-			alpha=alpha,
-			filters=filter_expression,
-			return_metadata=MetadataQuery(score=True),
-		)
+		# If no query vector (embedding unavailable), use pure BM25 keyword search
+		if query_vector is None:
+			results = collection.query.bm25(
+				query=query,
+				limit=limit,
+				filters=filter_expression,
+				return_metadata=MetadataQuery(score=True),
+			)
+		else:
+			results = collection.query.hybrid(
+				query=query,
+				vector=query_vector,
+				limit=limit,
+				alpha=alpha,
+				filters=filter_expression,
+				return_metadata=MetadataQuery(score=True),
+			)
 
 		items: list[dict[str, Any]] = []
 		for obj in results.objects:
@@ -276,5 +313,29 @@ class DocuMindWeaviateClient:
 				properties["uuid"] = str(obj.uuid)
 			items.append(properties)
 
+		return items
+
+	def fetch_all(
+		self,
+		doc_id: str,
+		limit: int = 50,
+	) -> list[dict[str, Any]]:
+		"""Fetch all nodes for a document (BM25 fallback when keyword search returns empty)."""
+		collection = self._get_collection()
+		filter_expr = Filter.by_property("doc_id").equal(doc_id)
+		results = collection.query.fetch_objects(
+			limit=limit,
+			filters=filter_expr,
+			return_metadata=MetadataQuery(score=True),
+		)
+		items: list[dict[str, Any]] = []
+		for obj in results.objects:
+			properties = dict(obj.properties or {})
+			metadata = obj.metadata
+			if metadata is not None and hasattr(metadata, "score"):
+				properties["score"] = metadata.score if metadata.score else 0.5
+			if hasattr(obj, "uuid"):
+				properties["uuid"] = str(obj.uuid)
+			items.append(properties)
 		return items
 

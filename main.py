@@ -1,12 +1,18 @@
 import os
+import re
+import json
+import base64
+import io
 import sys
 import shutil
+from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
+from PIL import Image
 
 from config import Config
 from ingestion.parser import parse_document
@@ -17,12 +23,13 @@ from graph.positive_expansion import PositiveExpander
 from graph.negative_expansion import NegativeExpander
 from retrieval.hybrid_search import HybridRetriever
 from retrieval.evidence_fusion import fuse_evidence
-from generation.prompt_builder import build_prompt_from_fusion
-from generation.risk_detector import score_nodes, confidence_from_risk, score_text
+from retrieval.query_expansion import expand_query
+from retrieval.reranker import rerank
+from generation.prompt_builder import build_prompt_from_fusion, build_prompt
+from generation.risk_detector import score_nodes, confidence_from_risk, calculate_confidence, score_text
 from generation.groq_client import chat
 from visualization.graph_snapshot import GraphVisualizer
 
-# Shared in-memory instances
 kg = KnowledgeGraph()
 visualizer = GraphVisualizer()
 pos_expander = PositiveExpander()
@@ -31,6 +38,8 @@ neg_expander = NegativeExpander()
 Config.validate()
 os.makedirs(Config.UPLOADS_DIR, exist_ok=True)
 os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
+
+_DOCUMENT_INSIGHTS: dict[str, dict] = {}
 
 app = FastAPI(
     title="DocuMind Graph API",
@@ -41,12 +50,15 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 VALID_GRAPH_TYPES = {"heading", "paragraph", "table", "image", "figure", "caption", "footnote", "chart"}
+CHART_KEYWORDS = ["chart", "graph", "plot", "axis", "trend", "bar chart", "line chart", "pie chart", "scatter", "histogram", "distribution"]
+FIGURE_PATTERN = re.compile(r'(?:figure|fig)[.\s]*(\d+)', re.IGNORECASE)
+TABLE_PATTERN = re.compile(r'(?:table)[.\s]*(\d+)', re.IGNORECASE)
+CHART_PATTERN = re.compile(r'(?:chart|graph)[.\s]*(\d+)', re.IGNORECASE)
 
 
 class QueryRequest(BaseModel):
@@ -54,9 +66,202 @@ class QueryRequest(BaseModel):
     cross_doc: bool = False
     doc_id: str | None = None
 
+
+def _image_to_base64(image_path: str, max_width: int = 800) -> str | None:
+    try:
+        img = Image.open(image_path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
+def _is_chart(vision_summary: str) -> bool:
+    if not vision_summary:
+        return False
+    s = vision_summary.lower()
+    return any(re.search(r'\b' + re.escape(kw) + r'\b', s) for kw in CHART_KEYWORDS)
+
+
+def _build_element_counts(elements: list) -> dict:
+    counts: dict = {}
+    for el in elements:
+        t = el.get("type", "unknown")
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def _group_text_by_page(elements: list) -> dict:
+    pages: dict = {}
+    for el in elements:
+        t = el.get("type")
+        if t not in ("heading", "paragraph", "caption", "footnote", "list_item", "formula"):
+            continue
+        page = str(el.get("page", 1))
+        pages.setdefault(page, {"headings": [], "caption": [], "paragraphs": []})
+        if t == "heading":
+            pages[page]["headings"].append(el["content"])
+        elif t == "caption":
+            pages[page]["caption"].append(el["content"])
+        else:
+            pages[page]["paragraphs"].append(el["content"])
+    return pages
+
+
+def _build_insights(doc_id: str, parse_result: dict, vision_results: dict) -> dict:
+    """Build and cache document insights including images, tables, charts, headings."""
+    elements = parse_result.get("elements", [])
+    img_list = parse_result.get("images", [])
+    element_counts = _build_element_counts(elements)
+    grouped_text = _group_text_by_page(elements)
+
+    vision_by_image_id: dict = {}
+    if vision_results:
+        for img_key, vres in vision_results.items():
+            if isinstance(vres, dict):
+                vision_by_image_id[img_key] = vres
+
+    images_data = []
+    for img in img_list:
+        img_id = img.get("image_id", "")
+        img_path = img.get("image_path", "")
+        cap = img.get("caption")
+        vres = vision_by_image_id.get(img_id, {})
+        vision_summary = vres.get("vision_summary", "") if isinstance(vres, dict) else ""
+        vision_detail = vres.get("vision_detail", {}) if isinstance(vres, dict) else {}
+        img_b64 = _image_to_base64(img_path) if os.path.exists(img_path) else None
+        figure_number = img.get("figure_number", "")
+        # Ensure vision_summary is never empty
+        if not vision_summary:
+            if cap:
+                vision_summary = cap
+            elif figure_number:
+                vision_summary = f"[Figure {figure_number}] image on page {img.get('page', 1)}"
+            else:
+                vision_summary = f"image on page {img.get('page', 1)}"
+        images_data.append({
+            "image_id": img_id,
+            "image_data": img_b64,
+            "page": img.get("page", 1),
+            "caption": cap,
+            "figure_number": figure_number,
+            "vision_summary": vision_summary,
+            "vision_detail": vision_detail,
+            "is_chart": _is_chart(vision_summary),
+        })
+
+    tables_data = []
+    for el in elements:
+        if el.get("type") == "table":
+            content = el.get("content", "")
+            md = dict(el.get("metadata") or {})
+            headers = md.get("table_headers", [])
+            rows = md.get("table_rows", [])
+            tables_data.append({
+                "page": el.get("page", 1),
+                "element_id": el.get("element_id", ""),
+                "markdown": content,
+                "summary": content[:200].strip(),
+                "table_number": md.get("table_number", ""),
+                "caption": md.get("table_caption", ""),
+                "headers": headers,
+                "rows": rows,
+            })
+
+    headings_data = []
+    for el in elements:
+        if el.get("type") == "heading":
+            headings_data.append({
+                "page": el.get("page", 1),
+                "content": el.get("content", ""),
+                "level": el.get("metadata", {}).get("heading_level", 1),
+            })
+
+    parser_used = parse_result.get("parser", "unknown")
+    parser_warning = parse_result.get("parser_warning")
+
+    insight = {
+        "document_name": parse_result.get("document_name", ""),
+        "document_id": doc_id,
+        "upload_time": datetime.now().isoformat(),
+        "parser": parser_used,
+        "parser_warning": parser_warning,
+        "stats": {
+            "pages": parse_result.get("pages_processed", 0),
+            "headings": element_counts.get("heading", 0),
+            "paragraphs": element_counts.get("paragraph", 0),
+            "tables": element_counts.get("table", 0),
+            "images": element_counts.get("image", 0),
+            "captions": element_counts.get("caption", 0),
+            "footnotes": element_counts.get("footnote", 0),
+            "list_items": element_counts.get("list_item", 0),
+            "formulas": element_counts.get("formula", 0),
+            "charts": sum(1 for img in images_data if img.get("is_chart")),
+        },
+        "images": images_data,
+        "tables": tables_data,
+        "headings": headings_data,
+        "extracted_text": grouped_text,
+    }
+    _DOCUMENT_INSIGHTS[doc_id] = insight
+    return insight
+
+
+def _find_figure(doc_id: str, figure_number: str) -> dict | None:
+    insight = _DOCUMENT_INSIGHTS.get(doc_id)
+    if not insight:
+        return None
+    for img in insight.get("images", []):
+        if str(img.get("figure_number", "")) == str(figure_number):
+            return img
+    return None
+
+
+def _find_table(doc_id: str, table_number: str) -> dict | None:
+    insight = _DOCUMENT_INSIGHTS.get(doc_id)
+    if not insight:
+        return None
+    for tbl in insight.get("tables", []):
+        if str(tbl.get("table_number", "")) == str(table_number):
+            return tbl
+    return None
+
+
+def _detect_figure_table_query(query: str, doc_id: str | None) -> dict | None:
+    """Check if query references a figure/table and return it."""
+    m = FIGURE_PATTERN.search(query)
+    if m and doc_id:
+        fig = _find_figure(doc_id, m.group(1))
+        if fig:
+            return {"type": "figure", "data": fig, "number": m.group(1)}
+
+    m = TABLE_PATTERN.search(query)
+    if m and doc_id:
+        tbl = _find_table(doc_id, m.group(1))
+        if tbl:
+            return {"type": "table", "data": tbl, "number": m.group(1)}
+
+    m = CHART_PATTERN.search(query)
+    if m and doc_id:
+        fig = _find_figure(doc_id, m.group(1))
+        if fig:
+            return {"type": "chart", "data": fig, "number": m.group(1)}
+
+    return None
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
 @app.get("/")
 async def root():
     return {"status": "healthy", "message": "DocuMind Graph v2.0 API is running."}
+
 
 @app.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(file: UploadFile = File(...)):
@@ -71,35 +276,43 @@ async def upload_document(file: UploadFile = File(...)):
     doc_id = os.path.splitext(file.filename)[0]
 
     try:
-        # 1. Parse
         parse_result = parse_document(file_path=file_path, doc_id=doc_id)
 
-        # 2. Vision (optional)
         vision_results = {}
         if Config.ENABLE_VISION:
             vision_results = summarize_images(parse_result.get("images", []) or [])
 
-        # 3. Nodes + embeddings + Weaviate
-        stats = run_ingestion_pipeline(parse_result=parse_result, vision_results=vision_results)
+        try:
+            stats = run_ingestion_pipeline(parse_result=parse_result, vision_results=vision_results)
+        except Exception as pipe_exc:
+            print(f"[Upload] Pipeline step failed (non-fatal): {pipe_exc}")
+            import traceback as tb
+            tb.print_exc()
+            stats = {"document_name": parse_result.get("document_name"), "note": f"Pipeline error: {pipe_exc}"}
 
-        # 4. Build knowledge graph synchronously in the same process
-        nodes_for_graph = [
-            {
-                "id":      el["element_id"],
-                "type":    el["type"] if el["type"] in VALID_GRAPH_TYPES else "paragraph",
-                "content": el["content"],
-                "page":    el["page"],
-                "section": el.get("metadata", {}).get("section", ""),
-                "doc_id":  doc_id,
-            }
-            for el in parse_result.get("elements", [])
-            if el.get("content", "").strip()
-        ]
+        # Build graph from parsed elements (non-fatal if it fails)
+        try:
+            nodes_for_graph = [
+                {
+                    "id":      el["element_id"],
+                    "type":    el["type"] if el["type"] in VALID_GRAPH_TYPES else "paragraph",
+                    "content": el["content"],
+                    "page":    el["page"],
+                    "section": el.get("metadata", {}).get("section", ""),
+                    "doc_id":  doc_id,
+                }
+                for el in parse_result.get("elements", [])
+                if el.get("content", "").strip()
+            ]
 
-        if nodes_for_graph:
-            kg.build_from_nodes(nodes_for_graph)
-            neg_expander.detect_negative_edges(kg)
-            print(f"[Graph] ✅ Built {kg.node_count} nodes, {kg.edge_count} edges for doc_id={doc_id}")
+            if nodes_for_graph:
+                kg.build_from_nodes(nodes_for_graph)
+                neg_expander.detect_negative_edges(kg)
+        except Exception as graph_exc:
+            print(f"[Upload] Graph build failed (non-fatal): {graph_exc}")
+
+        # Build and cache document insights
+        _build_insights(doc_id, parse_result, vision_results)
 
         return {
             "filename": file.filename,
@@ -108,7 +321,7 @@ async def upload_document(file: UploadFile = File(...)):
             "message": f"Ingested. Graph: {kg.node_count} nodes, {kg.edge_count} edges.",
             "graph_nodes": kg.node_count,
             "graph_edges": kg.edge_count,
-            "stats": stats,
+            "stats": stats or {},
         }
 
     except Exception as e:
@@ -123,67 +336,482 @@ async def query_pipeline(request: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     try:
-        # 1. Hybrid search
-        retriever = HybridRetriever()
-        hybrid_results = retriever.retrieve(query=request.query, doc_id=request.doc_id, cross_doc=request.cross_doc)
+        # ── Check for document summary queries ──────────────────────────
+        is_summary_query = any(w in request.query.lower() for w in
+            ["summarize", "summary", "overview", "what is this document about", "what does this document cover"])
 
-        # Deduplicate by node_id
-        seen: set = set()
-        all_results = []
-        for n in hybrid_results.get("semantic_results", []) + hybrid_results.get("keyword_results", []):
-            nid = n.get("node_id")
-            if nid and nid not in seen:
-                seen.add(nid)
-                all_results.append(n)
-        hybrid_results["semantic_results"] = all_results
-        hybrid_results["keyword_results"] = []
+        if is_summary_query and request.doc_id:
+            insight = _DOCUMENT_INSIGHTS.get(request.doc_id, {})
+            if insight:
+                doc_name = insight.get("document_name", request.doc_id)
+                stats = insight.get("stats", {})
+                headings = insight.get("headings", []) or []
+                tables = insight.get("tables", []) or []
+                images = insight.get("images", []) or []
+                extracted = insight.get("extracted_text", {})
+                pages_list = sorted(extracted.keys(), key=int)
 
-        # 2. Seed IDs present in graph
+                heading_text = "\n".join(
+                    f"{'#' * h.get('level', 1)} {h.get('content', '')}"
+                    for h in headings[:20]
+                ) if headings else ""
+
+                table_summaries = "\n".join(
+                    f"Table {t.get('table_number', '?')}: {t.get('caption', '')[:100]}"
+                    for t in tables[:5] if t.get('table_number') or t.get('caption')
+                ) if tables else ""
+
+                figure_summaries = "\n".join(
+                    f"Figure {i.get('figure_number', '?')}: {i.get('vision_summary', '')[:150]}"
+                    for i in images[:5] if i.get('figure_number') or i.get('vision_summary')
+                ) if images else ""
+
+                # Get first and last page paragraphs for intro/conclusion
+                first_page = pages_list[0] if pages_list else ""
+                last_page = pages_list[-1] if len(pages_list) > 1 else ""
+                first_paras = "\n".join(extracted.get(first_page, {}).get("paragraphs", [])[:3]) if first_page else ""
+                last_paras = "\n".join(extracted.get(last_page, {}).get("paragraphs", [])[-3:]) if last_page else ""
+
+                summary_context = f"""Document: {doc_name}
+Pages: {stats.get('pages', '?')}
+Sections/Headings:
+{heading_text or '(none)'}
+
+{'--- Tables ---' if table_summaries else ''}
+{table_summaries}
+
+{'--- Figures ---' if figure_summaries else ''}
+{figure_summaries}
+
+--- Opening paragraphs ---
+{first_paras[:500]}
+
+--- Closing paragraphs ---
+{last_paras[:500]}"""
+
+                summary_prompt = build_prompt(
+                    query=request.query,
+                    supporting=[{
+                        "type": "paragraph",
+                        "page": 1,
+                        "content": summary_context,
+                        "figure_number": "",
+                        "table_number": "",
+                        "caption": "",
+                        "vision_summary": "",
+                    }],
+                    exceptions=[], contradictions=[], risks=[],
+                    overall_risk_level="None",
+                    cross_doc=request.cross_doc,
+                )
+                answer = chat(summary_prompt["user"], system=summary_prompt["system"])
+                summary_conf = calculate_confidence("None", support_count=len(headings) + len(tables), has_media=bool(images))
+
+                return {
+                    "query": request.query,
+                    "routed": False,
+                    "answer": answer,
+                    "confidence_score": summary_conf,
+                    "risk_level": "None",
+                    "evidence": {
+                        "supporting": [{
+                            "type": "paragraph",
+                            "page": 1,
+                            "content": summary_context[:500],
+                            "document_id": request.doc_id,
+                            "document_name": doc_name,
+                            "pdf_url": f"http://localhost:8000/document/file/{request.doc_id}.pdf#page=1",
+                            "anchor": "page-1",
+                        }],
+                        "exceptions": [], "contradictions": [], "risks": [], "warnings": [], "limitations": [],
+                    },
+                    "documents_used": [request.doc_id],
+                }
+
+        # ── Query routing: check for figure/table references ───────────
+        routed = _detect_figure_table_query(request.query, request.doc_id)
+
+        if routed:
+            fig_data = routed["data"]
+            rtype = routed["type"]
+            rnum = routed["number"]
+            insight = _DOCUMENT_INSIGHTS.get(request.doc_id, {})
+            doc_name = insight.get("document_name", request.doc_id) if request.doc_id else ""
+
+            # Build evidence from graph neighbors + nearby paragraphs
+            evidence_nodes = []
+            nearby_text = ""
+
+            # Find related paragraph nodes via graph edges
+            if request.doc_id:
+                for nid, attrs in kg.graph.nodes(data=True):
+                    if attrs.get("doc_id") != request.doc_id:
+                        continue
+                    ntype = attrs.get("type", "")
+                    n_fig = attrs.get("metadata", {}).get("figure_number", "") or ""
+                    n_tbl = attrs.get("metadata", {}).get("table_number", "") or ""
+                    if rtype in ("figure", "chart") and n_fig and str(n_fig) == str(rnum):
+                        evidence_nodes.append({"node_id": nid, **attrs})
+                    if rtype == "table" and n_tbl and str(n_tbl) == str(rnum):
+                        evidence_nodes.append({"node_id": nid, **attrs})
+
+            # Add image data to figure nodes
+            supporting = []
+            if rtype in ("figure", "chart"):
+                for ev in evidence_nodes:
+                    ev["document_id"] = request.doc_id or ""
+                    ev["document_name"] = doc_name
+                    ev["page"] = ev.get("page", 1)
+                    ev["pdf_url"] = f"http://localhost:8000/document/file/{request.doc_id}.pdf#page={ev.get('page',1)}" if request.doc_id else ""
+                    ev["anchor"] = f"fig-{rnum}"
+                    # Add figure data from insight
+                    if fig_data and fig_data.get("image_data"):
+                        ev["image_data"] = fig_data["image_data"]
+                        ev["vision_summary"] = fig_data.get("vision_summary", "")
+                        ev["figure_number"] = rnum
+                        ev["caption"] = fig_data.get("caption", "")
+                    supporting.append(ev)
+                if not supporting:
+                    # Fallback: directly use fig_data as a standalone node
+                    if fig_data:
+                        supporting.append({
+                            "node_id": f"figure_{rnum}",
+                            "type": "figure",
+                            "page": fig_data.get("page", 1),
+                            "content": fig_data.get("caption", "") or fig_data.get("vision_summary", "") or "",
+                            "document_id": request.doc_id or "",
+                            "document_name": doc_name,
+                            "pdf_url": f"http://localhost:8000/document/file/{request.doc_id}.pdf#page={fig_data.get('page',1)}" if request.doc_id else "",
+                            "anchor": f"fig-{rnum}",
+                            "image_data": fig_data.get("image_data", ""),
+                            "vision_summary": fig_data.get("vision_summary", ""),
+                            "figure_number": rnum,
+                            "caption": fig_data.get("caption", ""),
+                            "vision_detail": fig_data.get("vision_detail", {}),
+                        })
+
+            elif rtype == "table":
+                for ev in evidence_nodes:
+                    ev["document_id"] = request.doc_id or ""
+                    ev["document_name"] = doc_name
+                    ev["page"] = ev.get("page", 1)
+                    ev["pdf_url"] = f"http://localhost:8000/document/file/{request.doc_id}.pdf#page={ev.get('page',1)}" if request.doc_id else ""
+                    ev["anchor"] = f"tbl-{rnum}"
+                    if fig_data:
+                        ev["headers"] = fig_data.get("headers", [])
+                        ev["rows"] = fig_data.get("rows", [])
+                        ev["table_number"] = rnum
+                        ev["caption"] = fig_data.get("caption", "")
+                        ev["table_markdown"] = fig_data.get("markdown", "")
+                    supporting.append(ev)
+                if not supporting and fig_data:
+                    supporting.append({
+                        "node_id": f"table_{rnum}",
+                        "type": "table",
+                        "page": fig_data.get("page", 1),
+                        "content": fig_data.get("markdown", fig_data.get("caption", ""))[:300],
+                        "document_id": request.doc_id or "",
+                        "document_name": doc_name,
+                        "pdf_url": f"http://localhost:8000/document/file/{request.doc_id}.pdf#page={fig_data.get('page',1)}" if request.doc_id else "",
+                        "anchor": f"tbl-{rnum}",
+                        "headers": fig_data.get("headers", []),
+                        "rows": fig_data.get("rows", []),
+                        "table_number": rnum,
+                        "caption": fig_data.get("caption", ""),
+                    })
+
+            # Gather nearby paragraphs from extracted text
+            extracted = insight.get("extracted_text", {})
+            page_str = str(fig_data.get("page", 1))
+            if page_str in extracted:
+                page_content = extracted[page_str]
+                paras = page_content.get("paragraphs", [])
+                if paras:
+                    nearby_text = "\n".join(paras[:8])
+                    supporting.append({
+                        "node_id": f"nearby_{page_str}",
+                        "type": "paragraph",
+                        "page": int(page_str),
+                        "content": nearby_text[:500],
+                        "document_id": request.doc_id or "",
+                        "document_name": doc_name,
+                        "pdf_url": f"http://localhost:8000/document/file/{request.doc_id}.pdf#page={page_str}" if request.doc_id else "",
+                        "anchor": f"page-{page_str}",
+                    })
+
+            # Build prompt and run LLM
+            rt = rtype
+            has_media = rt in ("figure", "chart", "table")
+            # Confidence: exact figure/table match >= 85%, higher with more evidence
+            routed_conf = calculate_confidence("None", support_count=max(len(supporting), 3), has_media=has_media)
+            if routed_conf < 0.85:
+                routed_conf = min(0.85 + 0.02 * len(supporting), 0.98)
+
+            if supporting:
+                prompt = build_prompt(
+                    query=request.query,
+                    supporting=supporting,
+                    exceptions=[], contradictions=[], risks=[],
+                    overall_risk_level="None",
+                    cross_doc=request.cross_doc,
+                )
+                answer = chat(prompt["user"], system=prompt["system"])
+            else:
+                answer = ""
+
+            return {
+                "query": request.query,
+                "routed": True,
+                "routed_type": rt,
+                "routed_number": rnum,
+                "figure": fig_data if rt in ("figure", "chart") else None,
+                "table": fig_data if rt == "table" else None,
+                "answer": answer,
+                "nearby_text": nearby_text,
+                "confidence_score": routed_conf,
+                "risk_level": "None",
+                "evidence": {
+                    "supporting": supporting,
+                    "exceptions": [], "contradictions": [], "risks": [],
+                },
+                "documents_used": [request.doc_id] if request.doc_id else [],
+            }
+
+        # ── Step 1: Query Expansion ────────────────────────────────────
+        query_variants = expand_query(request.query)
+
+        # ── Step 2: Hybrid Search (top_k=50, alpha=1.0 + alpha=0.0) ────
+        all_candidates: list[dict] = []
+        seen_ids: set = set()
+        for qv in query_variants:
+            hybrid_results = HybridRetriever().retrieve(query=qv, doc_id=request.doc_id, cross_doc=request.cross_doc)
+            for n in hybrid_results.get("semantic_results", []) + hybrid_results.get("keyword_results", []):
+                nid = n.get("node_id")
+                if nid and nid not in seen_ids:
+                    seen_ids.add(nid)
+                    all_candidates.append(n)
+
+        # ── Step 3: Cross-Encoder Reranking ─────────────────────────────
+        # Uses sigmoid-normalized scores + metadata-aware content
+        reranked = rerank(request.query, all_candidates, top_k=20)
+
+        # ── Step 4: Noise Removal ───────────────────────────────────────
+        def _is_noise(node: dict) -> bool:
+            content = str(node.get("content", "")).strip().lower()
+            ntype = str(node.get("type", "") or "").lower()
+            # Reference/bibliography/acknowledgement headings
+            if ntype == "heading" and any(w in content for w in
+                ["reference", "bibliography", "acknowledgement", "acknowledgment"]):
+                return True
+            # Citation-heavy content (reference list entries)
+            citation_count = len(re.findall(r'\[\d+\]', content))
+            if citation_count >= 5 and ntype != "table":
+                return True
+            # Very short non-image content
+            if len(content) < 30 and ntype not in ("image", "figure"):
+                return True
+            # Content that is only whitespace/punctuation
+            if content and all(c in " \t\n\r.,;:!?-" for c in content):
+                return True
+            return False
+
+        filtered = [n for n in reranked if not _is_noise(n)]
+
+        # ── Step 5: Context Filtering — keep only relevant ──────────────
+        SCORE_THRESHOLD = 0.05
+        quality = [n for n in filtered if n.get("_rerank_score", 0) >= SCORE_THRESHOLD]
+        if not quality:
+            quality = filtered[:5]  # fallback: keep top 5 if all scores are low
+
+        # ── Step 6: Dedup by content hash ───────────────────────────────
+        seen_hashes: set = set()
+        deduped: list[dict] = []
+        for n in quality:
+            content = str(n.get("content", "")).strip()
+            chash = hash(content) if content else 0
+            if chash and chash in seen_hashes:
+                continue
+            if chash:
+                seen_hashes.add(chash)
+            deduped.append(n)
+        filtered = deduped
+
+        # ── Step 7: Evidence Validation (retry once if top chunks are weak) ──
+        needs_retry = False
+        if filtered:
+            top_scores = [n.get("_rerank_score", 0) for n in filtered[:3] if n.get("_rerank_score") is not None]
+            avg_top = sum(top_scores) / len(top_scores) if top_scores else 0.0
+            if avg_top < 0.08:
+                needs_retry = True
+
+        if needs_retry:
+            retry_variants = [f"{request.query} about"] if request.doc_id else [request.query]
+            retry_candidates: list[dict] = []
+            seen_ids_r: set = set()
+            for qv in retry_variants:
+                hr = HybridRetriever().retrieve(query=qv, doc_id=request.doc_id, cross_doc=request.cross_doc)
+                for n in hr.get("semantic_results", []) + hr.get("keyword_results", []):
+                    nid = n.get("node_id")
+                    if nid and nid not in seen_ids_r:
+                        seen_ids_r.add(nid)
+                        retry_candidates.append(n)
+            if retry_candidates:
+                reranked2 = rerank(request.query, retry_candidates, top_k=20)
+                filtered2 = [n for n in reranked2 if not _is_noise(n)]
+                if filtered2:
+                    filtered = filtered2
+
+        # ── Graph expansion (for evidence panel only, NOT for confidence) ──
         seed_ids = [
-            n.get("node_id") for n in all_results
+            n.get("node_id") for n in filtered
             if n.get("node_id") and n.get("node_id") in kg.graph.nodes
         ]
-
-        # 3. Graph expansion
         pos_result = pos_expander.expand(seed_ids, kg) if seed_ids else {"seed_nodes": [], "evidence": [], "stats": {}}
         neg_result = neg_expander.expand(seed_ids, kg) if seed_ids else {
             "exceptions": [], "contradictions": [], "risks": [],
             "warnings": [], "limitations": [], "overall_risk_level": "None", "stats": {}
         }
 
-        # 4. Evidence fusion
-        fusion = fuse_evidence(hybrid_results, pos_result, neg_result)
+        # ── Enrich evidence with View PDF data + media for display ─────
+        enriched_supporting = []
+        media_candidates = list(filtered) + pos_result.get("evidence", [])
+        seen_in_pool = {id(n) for n in media_candidates}
+        for n in all_candidates:
+            if id(n) not in seen_in_pool:
+                ntype = str(n.get("type", "")).lower()
+                if ntype in ("image", "figure", "chart", "caption", "table"):
+                    media_candidates.append(n)
+                    seen_in_pool.add(id(n))
 
-        # 5. Risk + confidence
-        exceptions_and_contradictions = (
-            fusion.get("exceptions", []) +
-            fusion.get("contradictions", []) +
-            fusion.get("risks", [])
-        )
+        for node in media_candidates:
+            ndoc_id = node.get("doc_id", "") or (request.doc_id if not request.cross_doc else "")
+            npage = node.get("page", 1)
+            doc_insight = _DOCUMENT_INSIGHTS.get(ndoc_id, {})
+            doc_name = doc_insight.get("document_name", ndoc_id) if doc_insight else ndoc_id
 
-        # Score risk only on actual negative evidence nodes
-        if not fusion.get("supporting") and not exceptions_and_contradictions:
-            # No evidence at all — document not ingested or query out of scope
-            overall_risk = "None"
-        elif exceptions_and_contradictions:
-            risk_result = score_nodes(exceptions_and_contradictions)
-            overall_risk = risk_result.get("overall_risk_level", "None")
+            node["document_id"] = ndoc_id
+            node["document_name"] = doc_name
+            node["page"] = npage
+            node["pdf_url"] = f"http://localhost:8000/document/file/{ndoc_id}.pdf#page={npage}" if ndoc_id else ""
+
+            ntype = str(node.get("type", "")).lower()
+            fn = str(node.get("figure_number", "") or node.get("metadata", {}).get("figure_number", "") or "")
+            tn = str(node.get("table_number", "") or node.get("metadata", {}).get("table_number", "") or "")
+            if ntype in ("image", "figure", "chart") and fn:
+                node["anchor"] = f"fig-{fn}"
+            elif ntype == "table" and tn:
+                node["anchor"] = f"tbl-{tn}"
+            else:
+                node["anchor"] = f"page-{npage}"
+
+            # Media for evidence panel display (NOT for LLM)
+            if ntype in ("image", "figure", "chart") and ndoc_id:
+                fig = _find_figure(ndoc_id, fn) if fn else None
+                if not fig:
+                    for img in doc_insight.get("images", []):
+                        if int(img.get("page", 1)) == int(npage):
+                            fig = img
+                            break
+                if not fig:
+                    all_imgs = doc_insight.get("images", [])
+                    if all_imgs:
+                        fig = all_imgs[0]
+                if fig and fig.get("image_data"):
+                    node["image_data"] = fig["image_data"]
+                    node["vision_summary"] = fig.get("vision_summary", "")
+                    node["figure_number"] = fig.get("figure_number", fn)
+                    node["caption"] = fig.get("caption", node.get("caption", ""))
+            if ntype == "table" and ndoc_id:
+                tbl = _find_table(ndoc_id, tn) if tn else None
+                if not tbl:
+                    for t in doc_insight.get("tables", []):
+                        if int(t.get("page", 1)) == int(npage):
+                            tbl = t
+                            break
+                if tbl:
+                    node["headers"] = tbl.get("headers", [])
+                    node["rows"] = tbl.get("rows", [])
+                    node["table_number"] = tbl.get("table_number", tn)
+                    node["caption"] = tbl.get("caption", node.get("caption", ""))
+                    node["table_markdown"] = tbl.get("markdown", "")
+            enriched_supporting.append(node)
+
+        # Inject figure nodes for caption-only references (display only)
+        seen_fig_nums = set()
+        for node in list(enriched_supporting):
+            ntype = str(node.get("type", "")).lower()
+            fn = str(node.get("figure_number", "") or node.get("metadata", {}).get("figure_number", "") or "")
+            if ntype in ("caption", "heading") and fn and fn not in seen_fig_nums:
+                seen_fig_nums.add(fn)
+                ndoc_id = node.get("doc_id", "") or (request.doc_id if not request.cross_doc else "")
+                ndoc_name = _DOCUMENT_INSIGHTS.get(ndoc_id, {}).get("document_name", ndoc_id) if ndoc_id else ndoc_id
+                np = node.get("page", 1)
+                fig = _find_figure(ndoc_id, fn)
+                if fig and fig.get("image_data"):
+                    enriched_supporting.insert(0, {
+                        "node_id": f"figure_{fn}",
+                        "type": "figure",
+                        "page": np,
+                        "content": fig.get("caption", "") or fig.get("vision_summary", "") or "",
+                        "document_id": ndoc_id,
+                        "document_name": ndoc_name,
+                        "pdf_url": f"http://localhost:8000/document/file/{ndoc_id}.pdf#page={np}" if ndoc_id else "",
+                        "anchor": f"fig-{fn}",
+                        "image_data": fig.get("image_data", ""),
+                        "vision_summary": fig.get("vision_summary", ""),
+                        "figure_number": fn,
+                        "caption": fig.get("caption", ""),
+                    })
+
+        # Dedup enriched supporting (injections may add duplicates)
+        seen_combined: set = set()
+        final_supporting: list[dict] = []
+        for n in enriched_supporting:
+            key = (n.get("node_id", ""), n.get("document_id", ""), n.get("page", ""))
+            if key not in seen_combined:
+                seen_combined.add(key)
+                final_supporting.append(n)
+        enriched_supporting = final_supporting
+
+        # ── Compute confidence (retrieval quality only, no node count) ──
+        rerank_scores = [n.get("_rerank_score", 0) for n in filtered if n.get("_rerank_score") is not None]
+        avg_rerank = sum(rerank_scores) / len(rerank_scores) if rerank_scores else 0.0
+        retrieval_scores = [n.get("score", 0.5) for n in filtered if isinstance(n.get("score"), (int, float))]
+        avg_retrieval = sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else 0.0
+
+        # Evidence consistency: agreement between reranker and retrieval scores
+        # Low variance means high consistency
+        if rerank_scores and retrieval_scores and len(rerank_scores) == len(retrieval_scores):
+            diffs = [abs(r - s) for r, s in zip(rerank_scores, retrieval_scores)]
+            evidence_consistency = 1.0 - min(sum(diffs) / len(diffs), 1.0)
         else:
-            # No negative evidence — scan only the top 5 seed nodes, not all 50+
-            top_seeds = all_results[:5]
-            risk_result = score_nodes(top_seeds)
+            evidence_consistency = 0.5
+
+        # Formula: 0.5 * reranker + 0.3 * retrieval + 0.2 * consistency
+        confidence = 0.5 * avg_rerank + 0.3 * avg_retrieval + 0.2 * evidence_consistency
+
+        # Cap based on evidence quality (never use node count)
+        if not filtered:
+            confidence = min(confidence, 0.35)
+        elif avg_rerank < 0.1:
+            confidence = min(confidence, 0.60)
+
+        overall_risk = "None"
+        if neg_result.get("contradictions") or neg_result.get("risks"):
+            risk_result = score_nodes(neg_result.get("contradictions", []) + neg_result.get("risks", []))
             overall_risk = risk_result.get("overall_risk_level", "None")
-            # Cap at Medium when coming from supporting nodes only
-            if overall_risk == "High":
-                overall_risk = "Medium"
 
-        confidence = confidence_from_risk(overall_risk)
+        # Clamp
+        confidence = max(0.10, min(confidence, 0.97))
 
-        # 6. Prompt + generate
-        prompt = build_prompt_from_fusion(
+        # ── Build prompt from reranked evidence only ────────────────────
+        prompt = build_prompt(
             query=request.query,
-            fusion_result={"evidence": fusion},
-            risk_result={"overall_risk_level": overall_risk},
+            supporting=filtered,
+            exceptions=neg_result.get("exceptions", []),
+            contradictions=neg_result.get("contradictions", []),
+            risks=neg_result.get("risks", []),
+            overall_risk_level=overall_risk,
             cross_doc=request.cross_doc,
         )
         answer = chat(prompt["user"], system=prompt["system"])
@@ -192,18 +820,17 @@ async def query_pipeline(request: QueryRequest):
             "query": request.query,
             "cross_doc": request.cross_doc,
             "answer": answer,
-            "confidence_score": confidence,
+            "confidence_score": round(confidence, 4),
             "evidence": {
-                "supporting":     fusion.get("supporting", []),
-                "exceptions":     fusion.get("exceptions", []),
-                "contradictions": fusion.get("contradictions", []),
-                "risks":          fusion.get("risks", []),
-                "warnings":       fusion.get("warnings", []),
-                "limitations":    fusion.get("limitations", []),
-                "edges":          fusion.get("edges", []),
+                "supporting":     enriched_supporting,
+                "exceptions":     neg_result.get("exceptions", []),
+                "contradictions": neg_result.get("contradictions", []),
+                "risks":          neg_result.get("risks", []),
+                "warnings":       neg_result.get("warnings", []),
+                "limitations":    neg_result.get("limitations", []),
             },
             "risk_level": overall_risk,
-            "documents_used": fusion.get("documents_used", []),
+            "documents_used": [request.doc_id] if request.doc_id else [],
         }
 
     except Exception as e:
@@ -211,6 +838,34 @@ async def query_pipeline(request: QueryRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Document insights endpoints ──────────────────────────────────────────────
+
+@app.get("/document/{doc_id}/insights")
+async def get_document_insights(doc_id: str):
+    insight = _DOCUMENT_INSIGHTS.get(doc_id)
+    if not insight:
+        raise HTTPException(status_code=404, detail=f"No insights found for doc_id '{doc_id}'. Ingest the document first.")
+    return insight
+
+
+@app.get("/document/{doc_id}/figure/{figure_number}")
+async def get_figure(doc_id: str, figure_number: str):
+    fig = _find_figure(doc_id, figure_number)
+    if not fig:
+        raise HTTPException(status_code=404, detail=f"Figure {figure_number} not found in doc_id '{doc_id}'.")
+    return fig
+
+
+@app.get("/document/{doc_id}/table/{table_number}")
+async def get_table(doc_id: str, table_number: str):
+    tbl = _find_table(doc_id, table_number)
+    if not tbl:
+        raise HTTPException(status_code=404, detail=f"Table {table_number} not found in doc_id '{doc_id}'.")
+    return tbl
+
+
+# ── Graph endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/graph", response_class=HTMLResponse)
 async def get_graph():
@@ -240,7 +895,6 @@ async def get_graph():
 
 @app.get("/graph/data")
 async def get_graph_data():
-    """Return raw JSON data of the knowledge graph for the native React frontend."""
     if kg.node_count == 0:
         return {"nodes": [], "edges": []}
     return kg.export_graph()
@@ -253,21 +907,20 @@ async def get_graph_stats():
 
 @app.post("/reset")
 async def reset_collection():
-    """Wipe all Weaviate nodes and reset the in-memory graph. Re-ingest documents after this."""
     try:
         from vectorstore.weaviate_client import DocuMindWeaviateClient
         db = DocuMindWeaviateClient()
         db.clear_collection()
         db.close()
-        kg.__init__()  # reset in-memory graph
-        return {"status": "reset", "message": "Weaviate collection cleared and graph reset. Please re-ingest your documents."}
+        kg.__init__()
+        _DOCUMENT_INSIGHTS.clear()
+        return {"status": "reset", "message": "Weaviate collection cleared, graph reset, insights cleared. Please re-ingest your documents."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/reindex")
 async def reindex_negative_edges():
-    """Re-run negative edge detection on the existing in-memory graph without re-ingesting."""
     if kg.node_count == 0:
         raise HTTPException(status_code=400, detail="No graph loaded. Ingest a document first.")
     edges = neg_expander.detect_negative_edges(kg)
@@ -283,7 +936,6 @@ async def reindex_negative_edges():
 async def get_document_file(filename: str):
     file_path = os.path.join(Config.UPLOADS_DIR, filename)
     if not os.path.exists(file_path):
-        # Try appending .pdf if not provided
         file_path = os.path.join(Config.UPLOADS_DIR, f"{filename}.pdf")
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="File not found.")
@@ -296,7 +948,14 @@ async def delete_document(filename: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
     os.remove(file_path)
+    doc_id = os.path.splitext(filename)[0]
+    _DOCUMENT_INSIGHTS.pop(doc_id, None)
     return {"filename": filename, "status": "deleted"}
+
+
+@app.get("/documents")
+async def list_documents():
+    return {"documents": list(_DOCUMENT_INSIGHTS.keys())}
 
 
 if __name__ == "__main__":
