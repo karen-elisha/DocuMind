@@ -1,0 +1,599 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import {
+  Upload,
+  Trash2,
+  Network,
+  Activity,
+  Send,
+  Moon,
+  Sun,
+  ChevronDown,
+  ChevronUp,
+  FileText,
+  XCircle,
+  Database,
+  ExternalLink
+} from "lucide-react";
+import {
+  checkBackendStatus,
+  uploadDocument,
+  deleteDocument,
+  queryPipeline,
+  getGraphStats,
+  resetCollection
+} from "@/lib/api";
+import dynamic from "next/dynamic";
+
+const DynamicForceGraph = dynamic(() => import("@/components/ForceGraphView"), { 
+  ssr: false,
+  loading: () => <div className="flex-1 flex items-center justify-center text-slate-400"><Activity className="w-8 h-8 animate-spin" /></div>
+});
+
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+  meta?: any;
+};
+
+export default function Workspace() {
+  const [isDark, setIsDark] = useState(true);
+  const [backendOk, setBackendOk] = useState(false);
+  const [docs, setDocs] = useState<string[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadingFilename, setUploadingFilename] = useState<string | null>(null);
+  const [showGraph, setShowGraph] = useState(false);
+  const [activeNode, setActiveNode] = useState<any>(null);
+  const [showPdfUrl, setShowPdfUrl] = useState<string | null>(null);
+  const [stats, setStats] = useState<any>({});
+  
+  // Settings
+  const [targetDoc, setTargetDoc] = useState("");
+  const [crossDoc, setCrossDoc] = useState(false);
+  const [showEvidence, setShowEvidence] = useState(true);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isDark) {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, [isDark]);
+
+  useEffect(() => {
+    checkBackendStatus().then(setBackendOk);
+    getGraphStats().then(setStats).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setUploadingFilename(file.name);
+    try {
+      await uploadDocument(file);
+      if (!docs.includes(file.name)) {
+        setDocs([...docs, file.name]);
+      }
+      getGraphStats().then(setStats).catch(() => {});
+    } catch (err) {
+      console.error(err);
+      alert("Upload failed.");
+    } finally {
+      setUploading(false);
+      setUploadingFilename(null);
+    }
+  };
+
+  const handleDelete = async (filename: string) => {
+    try {
+      await deleteDocument(filename);
+      setDocs(docs.filter(d => d !== filename));
+      if (targetDoc === filename) setTargetDoc("");
+      getGraphStats().then(setStats).catch(() => {});
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleReset = async () => {
+    try {
+      await resetCollection();
+      setDocs([]);
+      setMessages([]);
+      setShowGraph(false);
+      setStats({});
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+    
+    const userMsg = input.trim();
+    setInput("");
+    setMessages(prev => [...prev, { role: "user", content: userMsg }]);
+    setLoading(true);
+
+    try {
+      const activeDocId = targetDoc ? targetDoc.split('.')[0] : undefined;
+      const res = await queryPipeline(userMsg, activeDocId, crossDoc);
+      setMessages(prev => [
+        ...prev,
+        {
+          role: "assistant",
+          content: res.answer || "No answer returned.",
+          meta: res,
+        }
+      ]);
+    } catch (err) {
+      console.error(err);
+      setMessages(prev => [...prev, { role: "assistant", content: "Query failed. Ensure the FastAPI backend is running on port 8000." }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-slate-50 dark:bg-[#0B0F14] text-slate-900 dark:text-slate-100 font-sans transition-colors duration-200">
+      
+      {/* LEFT COLUMN: SOURCES */}
+      <div className="w-[320px] flex-shrink-0 border-r border-slate-200 dark:border-slate-800 flex flex-col bg-white dark:bg-[#111827]">
+        <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+          <div className="font-bold text-lg flex items-center gap-2 tracking-tight">
+            <Database className="w-5 h-5 text-emerald-500" />
+            <span>Docu<span className="text-emerald-500">Mind</span></span>
+          </div>
+          <div className={`text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase tracking-wider flex items-center gap-1.5 ${backendOk ? 'bg-emerald-100 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-500 border-emerald-200 dark:border-emerald-500/20' : 'bg-red-100 dark:bg-red-500/10 text-red-600 dark:text-red-500 border-red-200 dark:border-red-500/20'}`}>
+            <div className={`w-1.5 h-1.5 rounded-full ${backendOk ? 'bg-emerald-500' : 'bg-red-500'}`} />
+            {backendOk ? 'API Online' : 'API Offline'}
+          </div>
+        </div>
+        
+        <div className="p-5 flex-1 overflow-y-auto">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="font-semibold text-sm text-slate-800 dark:text-slate-200">Sources</h3>
+            <span className="text-[10px] bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">{docs.length} Docs</span>
+          </div>
+          
+          <label className="border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-6 flex flex-col items-center justify-center cursor-pointer hover:border-emerald-500 dark:hover:border-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-500/5 transition-all group mb-6">
+            <input type="file" className="hidden" accept=".pdf,.docx" onChange={handleUpload} disabled={uploading} />
+            {uploading ? (
+              <Activity className="w-6 h-6 text-emerald-500 animate-spin mb-2" />
+            ) : (
+              <Upload className="w-6 h-6 text-slate-400 group-hover:text-emerald-500 mb-2 transition-colors" />
+            )}
+            <span className="text-sm font-medium text-slate-600 dark:text-slate-400 text-center px-4 truncate w-full">
+              {uploading ? `Ingesting ${uploadingFilename}...` : 'Drop files here or click'}
+            </span>
+          </label>
+
+          {docs.length > 0 && (
+            <div className="space-y-2">
+              <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Library</h4>
+              {docs.map(doc => (
+                <div key={doc} className="group bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/50 rounded-xl p-3 flex items-center justify-between hover:border-emerald-500/50 dark:hover:border-emerald-500/50 transition-all">
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <FileText className="w-4 h-4 text-emerald-500 flex-shrink-0" />
+                    <div className="truncate text-sm font-medium text-slate-700 dark:text-slate-300">{doc}</div>
+                  </div>
+                  <button onClick={() => handleDelete(doc)} className="text-slate-400 hover:text-red-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* CENTER COLUMN: CHAT */}
+      <div className="flex-1 flex flex-col min-w-0 relative">
+        <div className="h-14 border-b border-slate-200 dark:border-slate-800 flex items-center px-6 justify-between flex-shrink-0 bg-white/80 dark:bg-[#0B0F14]/80 backdrop-blur-md z-10">
+          <div className="font-semibold text-sm">Research Notebook</div>
+          <button onClick={() => setIsDark(!isDark)} className="p-2 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 transition-colors">
+            {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+        </div>
+
+        <div className="flex-1 flex overflow-hidden">
+          {showGraph ? (
+            <div className={`relative bg-white dark:bg-[#0B0F14] overflow-hidden flex-1 ${showPdfUrl ? 'border-r border-slate-200 dark:border-slate-800' : ''}`}>
+              <DynamicForceGraph onNodeClick={(node) => setActiveNode(node)} />
+            
+            {/* Overlay Panel for Clicked Node */}
+            {activeNode && (
+              <div className="absolute top-4 left-4 w-80 bg-white/95 dark:bg-[#111827]/95 backdrop-blur-md shadow-xl border border-slate-200 dark:border-slate-800 rounded-2xl p-5 z-20 flex flex-col max-h-[90%] overflow-hidden transition-all">
+                <div className="flex justify-between items-start mb-4 flex-shrink-0">
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Node Inspector</div>
+                    <div className="flex items-center gap-2">
+                      <span className="bg-emerald-100 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-500 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border border-emerald-200 dark:border-emerald-500/20">
+                        {activeNode.type}
+                      </span>
+                      {activeNode.page && <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Page {activeNode.page}</span>}
+                    </div>
+                  </div>
+                  <button onClick={() => setActiveNode(null)} className="text-slate-400 hover:text-red-500 transition-colors">
+                    <XCircle className="w-5 h-5" />
+                  </button>
+                </div>
+                
+                <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
+                  <div className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap font-medium">
+                    {activeNode.content}
+                  </div>
+                </div>
+                
+                <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-800 flex-shrink-0 flex items-center justify-between">
+                  <div className="text-[9px] text-slate-400 font-mono break-all bg-slate-50 dark:bg-[#0B0F14] p-2 rounded-lg border border-slate-200 dark:border-slate-800 flex-1 mr-2">
+                    ID: {activeNode.id}
+                  </div>
+                  {activeNode.doc_id && activeNode.page && (
+                    <button
+                      onClick={() => {
+                        const cleanContent = activeNode.content ? activeNode.content.replace(/[\r\n]+/g, ' ').trim() : '';
+                        // Use the first ~30 characters for a more reliable match across PDF line breaks
+                        const searchStr = cleanContent.length > 30 ? cleanContent.substring(0, 30) : cleanContent;
+                        const searchQuery = searchStr ? `&search="${encodeURIComponent(searchStr)}"` : '';
+                        setShowPdfUrl(`http://localhost:8000/document/file/${activeNode.doc_id}#page=${activeNode.page}${searchQuery}`);
+                      }}
+                      className="bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-500 px-3 py-2 rounded-lg transition-colors border border-emerald-200 dark:border-emerald-500/20 flex-shrink-0 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider cursor-pointer"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      View in PDF
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <button 
+              onClick={() => { setShowGraph(false); setActiveNode(null); setShowPdfUrl(null); }}
+              className="absolute top-4 right-4 bg-white/90 dark:bg-slate-800/90 shadow-lg border border-slate-200 dark:border-slate-700 px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors z-20 backdrop-blur-sm"
+            >
+              <XCircle className="w-4 h-4" /> Close Graph
+            </button>
+            </div>
+          ) : (
+            <div className={`flex-1 flex flex-col relative overflow-hidden bg-slate-50 dark:bg-[#0B0F14] ${showPdfUrl ? 'border-r border-slate-200 dark:border-slate-800' : ''}`}>
+              <div className="flex-1 overflow-y-auto p-6 scroll-smooth">
+              {messages.length === 0 && docs.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
+                  <Database className="w-16 h-16 opacity-20" />
+                  <div className="text-xl font-semibold text-slate-500">No sources added yet</div>
+                  <div className="text-sm">Upload documents to begin querying your knowledge base.</div>
+                </div>
+              ) : messages.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
+                  <Activity className="w-16 h-16 opacity-20" />
+                  <div className="text-xl font-semibold text-slate-500">Ready to Answer</div>
+                  <div className="text-sm">Ask a question below to start researching.</div>
+                </div>
+              ) : (
+                <div className="max-w-4xl mx-auto space-y-6">
+                  {messages.map((msg, i) => (
+                    <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[85%] rounded-2xl p-5 shadow-sm border ${
+                        msg.role === 'user' 
+                          ? 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-700 rounded-br-sm' 
+                          : 'bg-white dark:bg-[#111827] border-slate-200 dark:border-slate-800 rounded-bl-sm shadow-md'
+                      }`}>
+                        <div className="prose dark:prose-invert max-w-none text-sm leading-relaxed whitespace-pre-wrap">
+                          {msg.content}
+                        </div>
+                        {msg.role === 'assistant' && msg.meta && (
+                          <EvidencePanel meta={msg.meta} showEvidence={showEvidence} onShowPdf={setShowPdfUrl} />
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {loading && (
+                    <div className="flex justify-start">
+                      <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-2xl rounded-bl-sm p-5 flex items-center gap-3 text-slate-500 shadow-md">
+                        <Activity className="w-4 h-4 animate-spin text-emerald-500" />
+                        <span className="text-sm font-medium animate-pulse">Synthesizing response...</span>
+                      </div>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+              )}
+            </div>
+
+            <div className="p-6 bg-slate-50 dark:bg-[#0B0F14] border-t border-slate-200 dark:border-slate-800">
+              <form onSubmit={handleSubmit} className="max-w-4xl mx-auto relative flex items-center">
+                <input 
+                  type="text" 
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  placeholder="Ask your documents anything..." 
+                  className="w-full bg-white dark:bg-[#111827] border border-slate-300 dark:border-slate-700 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 rounded-2xl py-4 pl-5 pr-14 outline-none transition-all shadow-sm text-sm"
+                />
+                <button 
+                  type="submit" 
+                  disabled={!input.trim() || loading}
+                  className="absolute right-2 p-2 bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-300 disabled:dark:bg-slate-700 text-white rounded-xl transition-colors shadow-sm"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </form>
+            </div>
+          </div>
+          )}
+
+          {showPdfUrl && (
+            <div className="w-1/2 flex flex-col bg-slate-100 dark:bg-[#111827] relative">
+              <div className="h-14 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white/80 dark:bg-[#0B0F14]/80 backdrop-blur-md flex-shrink-0 z-10">
+                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Document Viewer</span>
+                <button onClick={() => setShowPdfUrl(null)} className="text-slate-400 hover:text-red-500 transition-colors">
+                  <XCircle className="w-5 h-5" />
+                </button>
+              </div>
+              <iframe src={showPdfUrl} className="flex-1 w-full border-none" />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* RIGHT COLUMN: STUDIO */}
+      <div className="w-[320px] flex-shrink-0 border-l border-slate-200 dark:border-slate-800 flex flex-col bg-white dark:bg-[#111827]">
+        <div className="p-5 border-b border-slate-200 dark:border-slate-800">
+          <h3 className="font-semibold text-sm">Studio</h3>
+        </div>
+        
+        <div className="p-5 overflow-y-auto space-y-8 flex-1">
+          <div className="space-y-3">
+            <button 
+              onClick={() => setShowGraph(true)}
+              className="w-full flex items-center gap-3 p-4 bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-xl hover:border-emerald-500 hover:shadow-sm transition-all font-semibold text-sm group"
+            >
+              <Network className="w-5 h-5 text-slate-400 group-hover:text-emerald-500 transition-colors" />
+              Knowledge Graph
+            </button>
+            <button disabled className="w-full flex items-center gap-3 p-4 bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-xl opacity-50 cursor-not-allowed font-semibold text-sm">
+              <FileText className="w-5 h-5 text-slate-400" />
+              Summary
+            </button>
+          </div>
+
+          <div>
+            <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">Graph Metrics</h4>
+            <div className="grid grid-cols-2 gap-3">
+              <MetricBox label="Total Nodes" value={stats.total_nodes || '—'} />
+              <MetricBox label="Positive Edges" value={stats.positive_edges || '—'} />
+              <MetricBox label="Total Edges" value={stats.total_edges || '—'} />
+              <MetricBox label="Negative Edges" value={stats.negative_edges || '—'} />
+            </div>
+          </div>
+
+          <hr className="border-slate-200 dark:border-slate-800" />
+
+          <div className="space-y-5">
+            <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Settings</h4>
+            
+            {docs.length > 0 && (
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Target Document</label>
+                <select 
+                  value={targetDoc} 
+                  onChange={e => setTargetDoc(e.target.value)}
+                  className="w-full bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 text-sm outline-none focus:border-emerald-500 transition-colors"
+                >
+                  <option value="">All Documents</option>
+                  {docs.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </div>
+            )}
+
+            <label className="flex items-center justify-between cursor-pointer group">
+              <span className="text-sm font-medium text-slate-700 dark:text-slate-300 group-hover:text-emerald-500 transition-colors">Cross-Document QA</span>
+              <div className={`w-10 h-5 rounded-full relative transition-colors ${crossDoc ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-700'}`} onClick={() => setCrossDoc(!crossDoc)}>
+                <div className={`absolute top-0.5 left-0.5 bg-white w-4 h-4 rounded-full transition-transform ${crossDoc ? 'translate-x-5' : ''}`} />
+              </div>
+            </label>
+
+            <label className="flex items-center justify-between cursor-pointer group">
+              <span className="text-sm font-medium text-slate-700 dark:text-slate-300 group-hover:text-emerald-500 transition-colors">Show Evidence</span>
+              <div className={`w-10 h-5 rounded-full relative transition-colors ${showEvidence ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-700'}`} onClick={() => setShowEvidence(!showEvidence)}>
+                <div className={`absolute top-0.5 left-0.5 bg-white w-4 h-4 rounded-full transition-transform ${showEvidence ? 'translate-x-5' : ''}`} />
+              </div>
+            </label>
+          </div>
+
+          <hr className="border-slate-200 dark:border-slate-800" />
+
+          <div className="flex gap-3">
+            <button onClick={() => setMessages([])} className="flex-1 py-2 text-sm font-semibold rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-slate-600 dark:text-slate-300">
+              Clear Chat
+            </button>
+            <button onClick={handleReset} className="flex-1 py-2 text-sm font-semibold rounded-lg border border-red-200 dark:border-red-900/30 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+              Reset All
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MetricBox({ label, value }: { label: string, value: string | number }) {
+  return (
+    <div className="bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-xl p-3 shadow-sm">
+      <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1 truncate">{label}</div>
+      <div className="text-lg font-bold text-slate-800 dark:text-slate-100">{value}</div>
+    </div>
+  );
+}
+
+function EvidencePanel({ meta, showEvidence, onShowPdf }: { meta: any, showEvidence: boolean, onShowPdf: (url: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [miniActiveNode, setMiniActiveNode] = useState<any>(null);
+  const risk = meta.risk_level || "None";
+  const conf = Math.round((meta.confidence_score || 0) * 100);
+  const ev = meta.evidence || {};
+  
+  const supporting = ev.supporting || [];
+  const risks = [
+    ...(ev.exceptions || []),
+    ...(ev.contradictions || []),
+    ...(ev.risks || []),
+    ...(ev.warnings || []),
+    ...(ev.limitations || [])
+  ];
+
+  const getRiskColor = (r: string) => {
+    switch (r.toLowerCase()) {
+      case 'high': return 'text-red-600 bg-red-100 dark:bg-red-500/10 border-red-200 dark:border-red-500/20';
+      case 'medium': return 'text-amber-600 bg-amber-100 dark:bg-amber-500/10 border-amber-200 dark:border-amber-500/20';
+      case 'low': return 'text-emerald-600 bg-emerald-100 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/20';
+      default: return 'text-slate-600 bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700';
+    }
+  };
+
+  const getConfColor = (c: number) => {
+    if (c >= 80) return 'bg-emerald-500';
+    if (c >= 50) return 'bg-amber-500';
+    return 'bg-red-500';
+  };
+
+  return (
+    <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700/50">
+      
+      {showEvidence && supporting.length > 0 && (
+        <div className="mb-5">
+          <div className="text-[10px] font-bold text-emerald-500 dark:text-emerald-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
+            <Network className="w-3.5 h-3.5" />
+            Related Subnodes & Child Nodes
+          </div>
+          <div className="h-[300px] rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700/50 relative bg-white dark:bg-[#0B0F14]">
+            <DynamicForceGraph 
+              graphData={{ nodes: [...supporting, ...risks], edges: ev.edges || [] }} 
+              onNodeClick={(node) => setMiniActiveNode(node)} 
+            />
+            {miniActiveNode && (
+              <div className="absolute top-2 right-2 w-64 bg-white/95 dark:bg-[#111827]/95 backdrop-blur-md shadow-lg border border-slate-200 dark:border-slate-800 rounded-xl p-3 z-20 flex flex-col max-h-[90%] overflow-hidden">
+                <div className="flex justify-between items-start mb-2">
+                  <span className="bg-emerald-100 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-500 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border border-emerald-200 dark:border-emerald-500/20">
+                    {miniActiveNode.type || 'NODE'}
+                  </span>
+                  <button onClick={() => setMiniActiveNode(null)} className="text-slate-400 hover:text-red-500">
+                    <XCircle className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto pr-1 text-xs text-slate-700 dark:text-slate-300 leading-relaxed custom-scrollbar mb-3">
+                  {miniActiveNode.content}
+                </div>
+                {miniActiveNode.doc_id && miniActiveNode.page && (
+                  <button
+                    onClick={() => {
+                      const cleanContent = miniActiveNode.content ? miniActiveNode.content.replace(/[\r\n]+/g, ' ').trim() : '';
+                      const searchStr = cleanContent.length > 30 ? cleanContent.substring(0, 30) : cleanContent;
+                      const searchQuery = searchStr ? `&search="${encodeURIComponent(searchStr)}"` : '';
+                      onShowPdf(`http://localhost:8000/document/file/${miniActiveNode.doc_id}#page=${miniActiveNode.page}${searchQuery}`);
+                    }}
+                    className="w-full bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-500 py-1.5 rounded-lg transition-colors border border-emerald-200 dark:border-emerald-500/20 flex items-center justify-center gap-1.5 text-[9px] font-bold uppercase tracking-wider cursor-pointer"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    View in PDF
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center gap-4 text-[11px] font-bold uppercase tracking-wider">
+        <div className={`px-2.5 py-1 rounded-full border ${getRiskColor(risk)}`}>
+          Risk: {risk}
+        </div>
+        <div className="flex-1 max-w-[150px]">
+          <div className="flex justify-between mb-1.5 text-[9px] text-slate-500 tracking-widest">
+            <span>Confidence</span>
+            <span>{conf}%</span>
+          </div>
+          <div className="h-1.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+            <div className={`h-full rounded-full transition-all duration-500 ${getConfColor(conf)}`} style={{ width: `${conf}%` }} />
+          </div>
+        </div>
+      </div>
+
+      {showEvidence && (
+        <div className="mt-4">
+          <button 
+            onClick={() => setOpen(!open)}
+            className="flex items-center gap-2 text-xs font-bold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors uppercase tracking-wider"
+          >
+            {open ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            View Evidence & Citations
+          </button>
+          
+          {open && (
+            <div className="mt-4 space-y-5">
+              <div className="grid grid-cols-4 gap-2">
+                <MetricBox label="Confidence" value={`${conf}%`} />
+                <MetricBox label="Supporting" value={supporting.length} />
+                <MetricBox label="Exceptions" value={risks.length} />
+                <MetricBox label="Risk Level" value={risk} />
+              </div>
+
+              {supporting.length > 4 && (
+                <div>
+                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2.5">More Supporting Evidence</div>
+                  <div className="space-y-2">
+                    {supporting.slice(4, 10).map((node: any, i: number) => (
+                      <EvCard key={i} node={node} isRisk={false} />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {risks.length > 0 && (
+                <div>
+                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2.5">Exceptions & Risks</div>
+                  <div className="space-y-2">
+                    {risks.slice(0, 5).map((node: any, i: number) => (
+                      <EvCard key={i} node={node} isRisk={true} />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EvCard({ node, isRisk }: { node: any, isRisk: boolean }) {
+  return (
+    <div className={`p-3.5 rounded-xl border bg-white dark:bg-[#111827] shadow-sm transition-all ${isRisk ? 'border-l-4 border-l-red-500 border-slate-200 dark:border-slate-800' : 'border-l-4 border-l-emerald-500 border-slate-200 dark:border-slate-800'}`}>
+      <div className="flex items-center gap-2 mb-2">
+        <span className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border border-slate-200 dark:border-slate-700">
+          {node.type || 'NODE'}
+        </span>
+        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
+          Page {node.page || '?'} {node.doc_id ? `• DOC: ${node.doc_id}` : ''}
+        </span>
+      </div>
+      <div className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed line-clamp-3">
+        {node.content}
+      </div>
+    </div>
+  );
+}

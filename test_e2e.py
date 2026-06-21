@@ -5,6 +5,8 @@ Tests all 6 stages: Parse → Vision → Nodes → Chunks → Embeddings → Wea
 """
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 
 from config import Config
 

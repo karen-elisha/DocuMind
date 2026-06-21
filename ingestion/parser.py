@@ -38,9 +38,12 @@ def _get_converter():
         ))
         t0 = time.perf_counter()
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.generate_picture_images = True
-        pipeline_options.generate_page_images = True
-        pipeline_options.images_scale = 2.0
+        # Only generate picture images when vision processing is enabled.
+        # generate_page_images=True at 2x scale was the cause of std::bad_alloc
+        # on large PDFs — it renders every page as a high-res image in memory.
+        pipeline_options.generate_picture_images = Config.ENABLE_VISION
+        pipeline_options.generate_page_images = False
+        pipeline_options.images_scale = 1.0  # 2.0 doubles RAM usage per page
         pipeline_options.do_ocr = Config.ENABLE_OCR
         pipeline_options.do_table_structure = Config.ENABLE_TABLE_STRUCTURE
         pdf_format_option = PdfFormatOption(pipeline_options=pipeline_options)
@@ -79,6 +82,23 @@ def _get_page(item: Any, default: int = 1) -> int:
 
 # ---- Main parser ----
 
+# Page threshold above which PyMuPDF is used instead of Docling.
+# Docling's ML layout model reliably crashes above ~38 pages on this machine.
+_PYMUPDF_PAGE_THRESHOLD = int(os.getenv("DOCLING_MAX_PAGES", "30"))
+
+
+def _count_pdf_pages(file_path: str) -> int:
+    """Quick page count without loading the full PDF."""
+    try:
+        import fitz
+        doc = fitz.open(file_path)
+        n = len(doc)
+        doc.close()
+        return n
+    except Exception:
+        return 0
+
+
 def parse_document(
     file_path: str,
     doc_id: str,
@@ -86,7 +106,11 @@ def parse_document(
     _timing: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
-    Extract all elements from a PDF/DOCX using Docling.
+    Smart hybrid parser: routes to PyMuPDF for large PDFs, Docling for small ones.
+
+    - PDF  ≥ DOCLING_MAX_PAGES pages → PyMuPDF  (fast, no ML, handles huge docs)
+    - PDF  <  DOCLING_MAX_PAGES pages → Docling  (rich metadata, table structure)
+    - DOCX (any size)               → Docling  (Docling DOCX support is excellent)
 
     Parameters
     ----------
@@ -95,18 +119,39 @@ def parse_document(
     """
     timings: Dict[str, float] = {} if _timing is None else _timing
 
-    converter = _get_converter()
-
     document_name = os.path.basename(file_path)
     _, ext = os.path.splitext(document_name.lower())
     if ext not in {".pdf", ".docx"}:
         raise ValueError(f"Unsupported file type: {ext}")
 
+    # Route large PDFs to PyMuPDF to avoid the bad_alloc ML crash
+    if ext == ".pdf":
+        num_pages = _count_pdf_pages(file_path)
+        if num_pages >= _PYMUPDF_PAGE_THRESHOLD:
+            print(
+                f"[Parser] PDF has {num_pages} pages (≥{_PYMUPDF_PAGE_THRESHOLD}). "
+                f"Using PyMuPDF (fast, no ML models)."
+            )
+            from ingestion.pymupdf_parser import parse_document_pymupdf
+            return parse_document_pymupdf(
+                file_path=file_path,
+                doc_id=doc_id,
+                images_out_dir=images_out_dir,
+                _timing=timings,
+            )
+        else:
+            print(
+                f"[Parser] PDF has {num_pages} pages (<{_PYMUPDF_PAGE_THRESHOLD}). "
+                f"Using Docling (rich metadata)."
+            )
+
+    converter = _get_converter()
+
     if images_out_dir is None:
         images_out_dir = os.path.join(Config.PROCESSED_DIR, "images", _safe_filename(doc_id))
     _ensure_dir(images_out_dir)
 
-    # ---- Conversion ----
+    # ---- Conversion (Docling path) ----
     t0 = time.perf_counter()
     print(f"[DoclingParser] Converting file: {file_path}")
     result = converter.convert(file_path)
@@ -262,9 +307,12 @@ def parse_document(
                 fn = getattr(tbl, "export_to_markdown", None)
                 if callable(fn):
                     try:
-                        content = fn()  # no doc arg — avoids re-parsing
+                        content = fn(doc)  # pass doc to suppress deprecation warning
                     except Exception:
-                        pass
+                        try:
+                            content = fn()  # fallback for older docling versions
+                        except Exception:
+                            pass
                 if not isinstance(content, str) or not content.strip():
                     content = str(getattr(tbl, "text", "")) if getattr(tbl, "text", None) else ""
                     content = content.strip()

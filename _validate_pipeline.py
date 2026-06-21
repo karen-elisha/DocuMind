@@ -12,7 +12,7 @@ print("=" * 70)
 
 from docling.document_converter import DocumentConverter
 
-pdf_path = r"C:\Users\tharu\OneDrive\Desktop\Dell\data\uploads\NIPS-2017-attention-is-all-you-need-Paper (1).pdf"
+pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploads", "NIPS-2017-attention-is-all-you-need-Paper (1).pdf")
 converter = DocumentConverter()
 result = converter.convert(pdf_path)
 doc = result.document

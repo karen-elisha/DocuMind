@@ -1,244 +1,280 @@
+"""Weaviate Cloud client helpers for DocuMind semantic memory."""
+
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, List
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import weaviate
-from weaviate.util import generate_uuid5
-from weaviate.auth import AuthApiKey
+from weaviate.classes import config as wc
+from weaviate.classes.init import Auth
+from weaviate.classes.query import Filter, MetadataQuery
 
 from config import Config
 
-logger = logging.getLogger(__name__)
+
+EmbeddingFn = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
 
-class WeaviateClient:
-    """
-    Minimal Weaviate wrapper used by ingestion layer.
+@dataclass(frozen=True)
+class SemanticNode:
+	"""Normalized payload that is stored in Weaviate."""
 
-    Stores chunk objects with required fields:
-      - node_id
-      - doc_id
-      - page
-      - type
-      - content
-      - metadata
+	node_id: str
+	doc_id: str
+	page: int
+	section: str
+	type: str
+	content: str
+	embedding: Sequence[float] | None = None
 
-    Design goals:
-      - Compatible with future Graph Construction / Expansion / Retrieval / Fusion
-      - Store metadata needed for filtering and provenance
 
-    Notes:
-      - This implementation auto-creates a collection if missing.
-      - Embeddings field is included if provided in chunk records.
-    """
+class DocuMindWeaviateClient:
+	"""Cloud-aware Weaviate wrapper for semantic node storage and hybrid retrieval."""
 
-    def __init__(self):
-        # Weaviate client v4 connection.
-        # With weaviate-client >=4, use connect_to_weaviate_cloud with:
-        # - cluster_url
-        # - auth_credentials
-        api_key = getattr(Config, "WEAVIATE_API_KEY", "") or ""
-        auth_credentials = AuthApiKey(api_key) if api_key else None
+	def __init__(
+		self,
+		cluster_url: str | None = None,
+		api_key: str | None = None,
+		collection_name: str | None = None,
+		embedding_model: str | None = None,
+		embedding_fn: EmbeddingFn | None = None,
+	) -> None:
+		self.cluster_url = (cluster_url or Config.WEAVIATE_URL).strip()
+		self.api_key = (api_key or Config.WEAVIATE_API_KEY).strip()
+		self.collection_name = (collection_name or Config.WEAVIATE_COLLECTION_NAME).strip()
+		self.embedding_model = (embedding_model or Config.WEAVIATE_EMBEDDING_MODEL).strip()
+		self._client: weaviate.WeaviateClient | None = None
+		self._embedding_fn = embedding_fn
+		self._embedder = None
 
-        # Weaviate Cloud / v4 connection
-        # Disable startup checks because gRPC health checks can be blocked/slow from this environment.
-        logger.info("WEAVIATE_URL = %s", Config.WEAVIATE_URL)
-        logger.info("WEAVIATE_API_KEY present = %s", bool(api_key))
-        self.client = weaviate.connect_to_weaviate_cloud(
-            cluster_url=Config.WEAVIATE_URL,
-            auth_credentials=auth_credentials,
-            skip_init_checks=True,
-        )
+	def connect(self) -> weaviate.WeaviateClient:
+		"""Connect to the configured Weaviate Cloud cluster."""
 
-    def close(self) -> None:
-        # weaviate-client v4 connection exposes close() in most variants
-        try:
-            close_fn = getattr(self.client, "close", None)
-            if callable(close_fn):
-                close_fn()
-        except Exception:
-            logger.exception("Failed to close Weaviate client")
+		if self._client is not None:
+			return self._client
 
-    def _ensure_collection(self, collection_name: str) -> None:
-        """
-        Ensure the Weaviate class/collection exists without hammering the schema endpoint.
+		if not self.cluster_url:
+			raise ValueError("WEAVIATE_URL must point to a Weaviate Cloud cluster URL.")
+		if not self.api_key:
+			raise ValueError("WEAVIATE_API_KEY is required to connect to Weaviate Cloud.")
 
-        Strategy:
-        1) Check existence via v4 client (preferred).
-        2) If missing, create via REST POST /v1/schema with exponential backoff on HTTP 429.
-        """
-        # 1) Existence check (fast; avoids repeated POST /v1/schema)
-        try:
-            exists = self.client.collections.exists(collection_name)
-            print(f"[Weaviate] collection exists? {exists} (class={collection_name})")
-            if exists:
-                return
-        except Exception as e:
-            print(f"[Weaviate] collection exists check failed (will fallback to REST). Error={e!r}")
+		self._client = weaviate.connect_to_weaviate_cloud(
+			cluster_url=self.cluster_url,
+			auth_credentials=Auth.api_key(self.api_key),
+			skip_init_checks=True,
+		)
+		return self._client
 
-        # 2) REST schema creation with exponential backoff for 429
-        import json
-        import time
-        from urllib import request as urlrequest
-        from urllib.error import HTTPError
+	def close(self) -> None:
+		"""Close the underlying client connection."""
 
-        base = Config.WEAVIATE_URL.rstrip("/")
-        schema_url = f"{base}/v1/schema"
+		if self._client is not None:
+			self._client.close()
+			self._client = None
 
-        api_key = getattr(Config, "WEAVIATE_API_KEY", "") or ""
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+	@property
+	def client(self) -> weaviate.WeaviateClient:
+		return self.connect()
 
-        schema = {
-            "class": collection_name,
-            "vectorizer": "none",
-            "properties": [
-                {"name": "node_id", "dataType": ["text"], "indexFilterable": True, "indexSearchable": True},
-                {"name": "doc_id", "dataType": ["text"], "indexFilterable": True, "indexSearchable": True},
-                {"name": "page", "dataType": ["int"], "indexFilterable": True, "indexSearchable": False},
-                {"name": "type", "dataType": ["text"], "indexFilterable": True, "indexSearchable": True},
-                {"name": "content", "dataType": ["text"], "indexFilterable": False, "indexSearchable": True},
-                {"name": "metadata", "dataType": ["text"], "indexFilterable": False, "indexSearchable": False},
-            ],
-        }
+	def clear_collection(self) -> None:
+		"""Delete and recreate the collection to wipe all stored nodes."""
+		client = self.client
+		existing = client.collections.list_all()
+		if self.collection_name in existing:
+			client.collections.delete(self.collection_name)
+		self.ensure_schema()
 
-        req = urlrequest.Request(
-            url=schema_url,
-            data=json.dumps(schema).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
+	def ensure_schema(self) -> None:
+		"""Create the semantic node collection if it does not exist yet."""
 
-        max_attempts = 5
-        backoff_s = 2
+		client = self.client
 
-        last_err: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                with urlrequest.urlopen(req, timeout=60) as resp:
-                    _ = resp.read()
-                print(f"[Weaviate] collection created successfully: class={collection_name}")
-                return
-            except HTTPError as e:
-                last_err = e
-                if e.code in (409, 422):
-                    print(f"[Weaviate] collection already exists (HTTP {e.code}): class={collection_name}")
-                    return
-                if e.code == 429:
-                    sleep_s = backoff_s * (2 ** (attempt - 1))
-                    print(f"[Weaviate] schema create rate-limited (429). attempt={attempt}/{max_attempts}. sleeping={sleep_s}s")
-                    time.sleep(sleep_s)
-                    continue
-                raise
-            except Exception as e:
-                last_err = e
-                sleep_s = backoff_s * (2 ** (attempt - 1))
-                print(f"[Weaviate] schema create failed attempt={attempt}/{max_attempts}. sleeping={sleep_s}s. Error={e!r}")
-                time.sleep(sleep_s)
+		existing = client.collections.list_all()
+		if self.collection_name in existing:
+			return
 
-        raise RuntimeError(f"Failed to ensure Weaviate class exists: {collection_name}. LastError={last_err!r}")
 
-    def upsert_chunks(self, *, collection_name: str, chunks: List[Dict[str, Any]]) -> None:
-        """
-        Upsert chunks into Weaviate.
-        Each chunk dict should contain:
-          - chunk_id (optional)
-          - node_id
-          - doc_id
-          - page
-          - type
-          - content
-          - metadata (dict)
-          - embedding (vector) optional
-        """
-        if not chunks:
-            return
+		client.collections.create(
+			name=self.collection_name,
+			vectorizer_config=wc.Configure.Vectorizer.none(),
+			properties=[
+				wc.Property(name="node_id", data_type=wc.DataType.TEXT),
+				wc.Property(name="doc_id", data_type=wc.DataType.TEXT),
+				wc.Property(name="page", data_type=wc.DataType.INT),
+				wc.Property(name="section", data_type=wc.DataType.TEXT),
+				wc.Property(name="type", data_type=wc.DataType.TEXT),
+				wc.Property(name="content", data_type=wc.DataType.TEXT),
+			],
+		)
 
-        self._ensure_collection(collection_name)
+	def _get_collection(self):
+		self.ensure_schema()
+		return self.client.collections.get(self.collection_name)
 
-        # Insert via REST batch endpoint to avoid weaviate-client internals.
-        import json
-        from urllib import request as urlrequest
+	def _embed_texts(self, texts: Sequence[str], batch_size: int = 32) -> list[list[float]]:
+		if self._embedding_fn is not None:
+			return [list(vector) for vector in self._embedding_fn(texts)]
 
-        base = Config.WEAVIATE_URL.rstrip("/")
-        url = f"{base}/v1/batch/objects"
+		if self._embedder is None:
+			try:
+				from sentence_transformers import SentenceTransformer
+			except ImportError as exc:
+				raise RuntimeError(
+					"sentence-transformers is required for BGE-small-en-v1.5 embeddings."
+				) from exc
 
-        api_key = getattr(Config, "WEAVIATE_API_KEY", "") or ""
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+			self._embedder = SentenceTransformer(self.embedding_model)
 
-        objects = []
-        for ch in chunks:
-            node_id = ch.get("node_id") or ""
-            doc_id = ch.get("doc_id") or ""
-            page = int(ch.get("page") or 1)
-            ctype = ch.get("type") or ""
-            content = ch.get("content") or ""
-            metadata = ch.get("metadata") or {}
-            embedding = ch.get("embedding")
+		vectors: list[list[float]] = []
+		text_list = list(texts)
+		for start in range(0, len(text_list), batch_size):
+			batch = text_list[start:start + batch_size]
+			embeddings = self._embedder.encode(batch, normalize_embeddings=True)
+			if hasattr(embeddings, "tolist"):
+				vectors.extend([list(vector) for vector in embeddings.tolist()])
+			else:
+				vectors.extend([list(vector) for vector in embeddings])
 
-            uid = None
-            if node_id and doc_id:
-                uid = generate_uuid5(f"{node_id}|{doc_id}|{page}|{ctype}")
+		return vectors
 
-            metadata_str = json.dumps(metadata, ensure_ascii=False)
+	def _node_uuid(self, node: SemanticNode) -> str:
+		raw_key = f"{node.doc_id}:{node.node_id}:{node.page}:{node.type}"
+		return str(uuid.uuid5(uuid.NAMESPACE_URL, raw_key))
 
-            obj = {
-                "class": collection_name,
-                "properties": {
-                    "node_id": node_id,
-                    "doc_id": doc_id,
-                    "page": page,
-                    "type": ctype,
-                    "content": content,
-                    "metadata": metadata_str,
-                },
-            }
-            if uid:
-                obj["id"] = uid
-            if embedding is not None:
-                obj["vector"] = embedding
+	def _normalize_node(self, node: Mapping[str, Any] | SemanticNode) -> SemanticNode:
+		if isinstance(node, SemanticNode):
+			return node
 
-            objects.append(obj)
+		node_id = node.get("node_id") or node.get("id")
+		required_fields = {
+			"node_id": node_id,
+			"doc_id": node.get("doc_id"),
+			"page": node.get("page"),
+			"type": node.get("type"),
+			"content": node.get("content"),
+		}
+		missing = [name for name, value in required_fields.items() if value in (None, "")]
+		if missing:
+			raise ValueError(f"SemanticNode is missing required fields: {', '.join(missing)}")
 
-        payload = {"objects": objects, "batchSize": len(objects)}
+		page = required_fields["page"]
+		if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+			raise ValueError("SemanticNode.page must be a positive integer")
 
-        req = urlrequest.Request(
-            url=url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urlrequest.urlopen(req, timeout=60) as resp:
-            _ = resp.read()
+		return SemanticNode(
+			node_id=str(node_id),
+			doc_id=str(required_fields["doc_id"]),
+			page=int(page),
+			section=str(node.get("section", "")),
+			type=str(required_fields["type"]),
+			content=str(required_fields["content"]),
+			embedding=node.get("embedding"),
+		)
 
-    def semantic_search(
-        self,
-        query_vector: list,
-        collection_name: str | None = None,
-        limit: int = 10,
-    ):
-        collection_name = (
-            collection_name
-            or getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
-        )
-        collection = self.client.collections.get(collection_name)
-        response = collection.query.near_vector(near_vector=query_vector, limit=limit)
-        return response.objects
+	def upsert_nodes(self, nodes: Iterable[Mapping[str, Any] | SemanticNode]) -> list[str]:
+		"""Insert or replace semantic nodes in Weaviate using batch for performance."""
 
-    def keyword_search(
-        self,
-        query: str,
-        collection_name: str | None = None,
-        limit: int = 10,
-    ):
-        collection_name = (
-            collection_name
-            or getattr(Config, "WEAVIATE_COLLECTION", "DocumentNode")
-        )
-        collection = self.client.collections.get(collection_name)
-        response = collection.query.bm25(query=query, limit=limit)
-        return response.objects
+		normalized_nodes = [self._normalize_node(node) for node in nodes]
+		if not normalized_nodes:
+			return []
+
+		# Generate embeddings for all nodes that don't have one
+		embeddings_to_generate = [node.content for node in normalized_nodes if node.embedding is None]
+		generated_embeddings: list[list[float]] = []
+		if embeddings_to_generate:
+			generated_embeddings = self._embed_texts(embeddings_to_generate)
+
+		# Pair each node with its embedding
+		paired: list[tuple[SemanticNode, list[float]]] = []
+		gen_idx = 0
+		for node in normalized_nodes:
+			if node.embedding is not None:
+				paired.append((node, list(node.embedding)))
+			else:
+				paired.append((node, generated_embeddings[gen_idx]))
+				gen_idx += 1
+
+		collection = self._get_collection()
+		stored_ids: list[str] = []
+
+		# Use Weaviate batch insert — one round-trip for all nodes instead of N
+		with collection.batch.fixed_size(batch_size=100) as batch:
+			for node, embedding in paired:
+				object_id = self._node_uuid(node)
+				properties = {
+					"node_id": node.node_id,
+					"doc_id": node.doc_id,
+					"page": node.page,
+					"section": node.section,
+					"type": node.type,
+					"content": node.content,
+				}
+				batch.add_object(
+					properties=properties,
+					vector=embedding,
+					uuid=object_id,
+				)
+				stored_ids.append(str(object_id))
+
+		# Surface any per-object errors from the batch
+		failed = collection.batch.failed_objects
+		if failed:
+			import logging
+			logger = logging.getLogger(__name__)
+			logger.warning("Batch upsert: %d objects failed to insert.", len(failed))
+			for fo in failed[:5]:
+				logger.warning("  Failed object: %s", fo)
+
+		return stored_ids
+
+	def hybrid_search(
+		self,
+		query: str,
+		limit: int = 2,
+		doc_id: str | None = None,
+		node_type: str | None = None,
+		page: int | None = None,
+		alpha: float = 0.5,
+	) -> list[dict[str, Any]]:
+		"""Run hybrid vector + keyword retrieval with optional metadata filters."""
+
+		collection = self._get_collection()
+		filters = []
+		if doc_id:
+			filters.append(Filter.by_property("doc_id").equal(doc_id))
+		if node_type:
+			filters.append(Filter.by_property("type").equal(node_type))
+		if page is not None:
+			filters.append(Filter.by_property("page").equal(page))
+
+		filter_expression = None
+		if filters:
+			filter_expression = filters[0]
+			for extra_filter in filters[1:]:
+				filter_expression = filter_expression & extra_filter
+
+		query_vector = self._embed_texts([query])[0]
+
+		results = collection.query.hybrid(
+			query=query,
+			vector=query_vector,
+			limit=limit,
+			alpha=alpha,
+			filters=filter_expression,
+			return_metadata=MetadataQuery(score=True),
+		)
+
+		items: list[dict[str, Any]] = []
+		for obj in results.objects:
+			properties = dict(obj.properties or {})
+			metadata = obj.metadata
+			if metadata is not None and hasattr(metadata, "score"):
+				properties["score"] = metadata.score
+			if hasattr(obj, "uuid"):
+				properties["uuid"] = str(obj.uuid)
+			items.append(properties)
+
+		return items
+

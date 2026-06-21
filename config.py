@@ -20,9 +20,13 @@ class Config:
             WEAVIATE_URL = f"https://{WEAVIATE_URL}"
     WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY", "")
     WEAVIATE_COLLECTION = os.getenv("WEAVIATE_COLLECTION", "DocuMindNode")
+    # Alias for backward compatibility with integration-branch code
+    WEAVIATE_COLLECTION_NAME = WEAVIATE_COLLECTION
 
     # Embeddings
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    # Alias for backward compatibility with integration-branch code
+    WEAVIATE_EMBEDDING_MODEL = os.getenv("WEAVIATE_EMBEDDING_MODEL", EMBEDDING_MODEL)
 
     # Chunking config (character-based)
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -47,7 +51,7 @@ class Config:
         if not cls.GROQ_API_KEY:
             print("[WARNING] GROQ_API_KEY is not set in environment variables.")
         if not cls.WEAVIATE_URL:
-            raise ValueError("[ERROR] WEAVIATE_URL is not set.")
+            print("[WARNING] WEAVIATE_URL is not set. Point it to your Weaviate Cloud cluster URL.")
         if not cls.WEAVIATE_API_KEY:
             # Weaviate can still work for local/dev clusters without auth.
             print("[WARNING] WEAVIATE_API_KEY is not set in environment variables (continuing).")
