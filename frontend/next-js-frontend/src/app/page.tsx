@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   Upload, Trash2, Network, Activity, Send,
   Moon, Sun, ChevronDown, ChevronUp,
-  FileText, XCircle, Database, ExternalLink
+  FileText, XCircle, Database, ExternalLink, Map
 } from "lucide-react";
 import {
   checkBackendStatus, uploadDocument, deleteDocument,
@@ -16,11 +16,23 @@ import DocumentInsights from "@/components/DocumentInsights";
 import FigureViewer from "@/components/FigureViewer";
 import TableViewer from "@/components/TableViewer";
 import MarkdownMessage from "@/components/MarkdownMessage";
+import FactLockPanel from "@/components/FactLockPanel";
+import DemoModePanel from "@/components/DemoModePanel";
+import { buildMindMapChatQuery } from "@/lib/mindmapChat";
 
 const DynamicForceGraph = dynamic(() => import("@/components/ForceGraphView"), {
   ssr: false,
   loading: () => <div className="flex-1 flex items-center justify-center text-slate-400"><Activity className="w-8 h-8 animate-spin" /></div>
 });
+
+const DynamicMindMap = dynamic(() => import("@/components/MindMapView"), {
+  ssr: false,
+  loading: () => <div className="flex-1 flex items-center justify-center text-slate-400"><Activity className="w-8 h-8 animate-spin" /></div>
+});
+
+const PdfSectionViewer = dynamic(() => import("@/components/PdfSectionViewer"), { ssr: false });
+
+const RiskRadar = dynamic(() => import("@/components/RiskRadar"), { ssr: false });
 
 type Message = {
   role: "user" | "assistant";
@@ -38,8 +50,17 @@ export default function Workspace() {
   const [uploading, setUploading] = useState(false);
   const [uploadingFilename, setUploadingFilename] = useState<string | null>(null);
   const [showGraph, setShowGraph] = useState(false);
+  const [showMindMap, setShowMindMap] = useState(false);
   const [activeNode, setActiveNode] = useState<any>(null);
   const [showPdfUrl, setShowPdfUrl] = useState<string | null>(null);
+  const [pdfHighlight, setPdfHighlight] = useState<{
+    docId: string;
+    page: number;
+    bbox?: number[];
+    pageHeight?: number;
+    searchText?: string;
+    label?: string;
+  } | null>(null);
   const [stats, setStats] = useState<any>({});
 
   // Insights
@@ -53,6 +74,7 @@ export default function Workspace() {
   const [targetDoc, setTargetDoc] = useState("");
   const [crossDoc, setCrossDoc] = useState(false);
   const [showEvidence, setShowEvidence] = useState(true);
+  const [demoRefresh, setDemoRefresh] = useState(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -99,6 +121,7 @@ export default function Workspace() {
       if (result.doc_id) {
         await loadInsights(result.doc_id);
         setShowInsights(true);
+        setDemoRefresh((k) => k + 1);
       }
     } catch (err) {
       console.error(err);
@@ -130,6 +153,7 @@ export default function Workspace() {
       setDocs([]);
       setMessages([]);
       setShowGraph(false);
+      setShowMindMap(false);
       setStats({});
       setInsights(null);
       setShowInsights(false);
@@ -148,20 +172,21 @@ export default function Workspace() {
     setViewerFigure(null);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
-
-    const userMsg = input.trim();
-    setInput("");
-    setMessages(prev => [...prev, { role: "user", content: userMsg }]);
+  const submitQuery = async (
+    userMsg: string,
+    overrideDocId?: string,
+    options?: { displayContent?: string },
+  ) => {
+    if (!userMsg.trim()) return;
+    const shown = (options?.displayContent ?? userMsg).trim();
+    setMessages(prev => [...prev, { role: "user", content: shown }]);
     setLoading(true);
 
     try {
-      const activeDocId = targetDoc ? targetDoc.split('.')[0] : undefined;
-      const res = await queryPipeline(userMsg, activeDocId, crossDoc);
+      const activeDocId = overrideDocId
+        || (targetDoc ? targetDoc.split('.')[0] : undefined);
+      const res = await queryPipeline(userMsg.trim(), activeDocId, crossDoc);
 
-      // Handle routed figure/table response
       if (res.routed) {
         const msg: Message = {
           role: "assistant",
@@ -176,11 +201,12 @@ export default function Workspace() {
             confidence_score: res.confidence_score,
             risk_level: res.risk_level,
             documents_used: res.documents_used,
+            fact_lock: res.fact_lock,
+            risk_radar: res.risk_radar,
           }
         };
         setMessages(prev => [...prev, msg]);
 
-        // Auto-show viewer
         if (res.figure) {
           setViewerFigure(res.figure);
           setViewerNearbyText(res.nearby_text || "");
@@ -203,6 +229,60 @@ export default function Workspace() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleDemoSelect = (query: string, docId: string) => {
+    const existing = docs.find(
+      (d) => d.replace(/\.(pdf|docx)$/i, "") === docId,
+    );
+    const filename = existing || `${docId}.pdf`;
+    if (!docs.includes(filename)) {
+      setDocs((prev) => (prev.includes(filename) ? prev : [...prev, filename]));
+    }
+    setTargetDoc(filename);
+    loadInsights(docId);
+    submitQuery(query, docId);
+  };
+
+  const handleMindMapChat = (node: {
+    type: string;
+    label: string;
+    page: number;
+    content: string;
+    preview?: string;
+  }) => {
+    const docId = targetDoc ? targetDoc.replace(/\.(pdf|docx)$/i, "") : "";
+    if (!docId) return;
+    setShowMindMap(false);
+    const { display, api } = buildMindMapChatQuery(node);
+    submitQuery(api, docId, { displayContent: display });
+  };
+
+  const handleMindMapPdf = (node: {
+    label: string;
+    page: number;
+    bbox?: number[];
+    page_height?: number;
+  }) => {
+    const docId = targetDoc ? targetDoc.replace(/\.(pdf|docx)$/i, "") : "";
+    if (!docId) return;
+    setShowPdfUrl(null);
+    setPdfHighlight({
+      docId,
+      page: node.page,
+      bbox: node.bbox,
+      pageHeight: node.page_height,
+      searchText: node.label,
+      label: node.label,
+    });
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+    const userMsg = input.trim();
+    setInput("");
+    await submitQuery(userMsg);
   };
 
   return (
@@ -312,7 +392,16 @@ export default function Workspace() {
         <div className="flex-1 flex overflow-hidden">
           {/* Main content area */}
           <div className={`flex-1 flex flex-col overflow-hidden ${showInsights ? 'border-r border-slate-200 dark:border-slate-800' : ''}`}>
-            {showGraph ? (
+            {showMindMap && targetDoc ? (
+              <div className="relative bg-white dark:bg-[#0B0F14] overflow-hidden flex-1">
+                <DynamicMindMap
+                  docId={targetDoc.replace(/\.(pdf|docx)$/i, "")}
+                  onClose={() => setShowMindMap(false)}
+                  onChat={handleMindMapChat}
+                  onViewPdf={handleMindMapPdf}
+                />
+              </div>
+            ) : showGraph ? (
               <div className="relative bg-white dark:bg-[#0B0F14] overflow-hidden flex-1">
                 <DynamicForceGraph onNodeClick={(node) => setActiveNode(node)} />
 
@@ -400,6 +489,7 @@ export default function Workspace() {
                                 onShowPdf={setShowPdfUrl}
                                 onShowFigure={handleShowFigure}
                                 onShowTable={handleShowTable}
+                                targetDoc={targetDoc}
                               />
                             )}
                           </div>
@@ -453,15 +543,22 @@ export default function Workspace() {
           )}
 
           {/* PDF viewer */}
-          {showPdfUrl && (
+          {(showPdfUrl || pdfHighlight) && (
             <div className="w-1/2 flex flex-col bg-slate-100 dark:bg-[#111827] relative">
               <div className="h-14 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white/80 dark:bg-[#0B0F14]/80 backdrop-blur-md flex-shrink-0 z-10">
                 <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Document Viewer</span>
-                <button onClick={() => setShowPdfUrl(null)} className="text-slate-400 hover:text-red-500 transition-colors">
+                <button
+                  onClick={() => { setShowPdfUrl(null); setPdfHighlight(null); }}
+                  className="text-slate-400 hover:text-red-500 transition-colors"
+                >
                   <XCircle className="w-5 h-5" />
                 </button>
               </div>
-              <iframe src={showPdfUrl} className="flex-1 w-full border-none" />
+              {pdfHighlight ? (
+                <PdfSectionViewer highlight={pdfHighlight} />
+              ) : (
+                <iframe src={showPdfUrl!} className="flex-1 w-full border-none" />
+              )}
             </div>
           )}
         </div>
@@ -476,12 +573,21 @@ export default function Workspace() {
         <div className="p-5 overflow-y-auto space-y-8 flex-1">
           <div className="space-y-3">
             <button
-              onClick={() => setShowGraph(true)}
+              onClick={() => { setShowGraph(true); setShowMindMap(false); }}
               className="w-full flex items-center gap-3 p-4 bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-xl hover:border-emerald-500 hover:shadow-sm transition-all font-semibold text-sm group"
             >
               <Network className="w-5 h-5 text-slate-400 group-hover:text-emerald-500 transition-colors" />
               Knowledge Graph
             </button>
+            {targetDoc && (
+              <button
+                onClick={() => { setShowMindMap(true); setShowGraph(false); }}
+                className="w-full flex items-center gap-3 p-4 bg-slate-50 dark:bg-[#0B0F14] border border-slate-200 dark:border-slate-800 rounded-xl hover:border-amber-500 hover:shadow-sm transition-all font-semibold text-sm group"
+              >
+                <Map className="w-5 h-5 text-slate-400 group-hover:text-amber-500 transition-colors" />
+                Mind Map
+              </button>
+            )}
             {insights && (
               <button
                 onClick={() => setShowInsights(!showInsights)}
@@ -544,6 +650,15 @@ export default function Workspace() {
 
           <hr className="border-slate-200 dark:border-slate-800" />
 
+          <DemoModePanel
+            targetDoc={targetDoc}
+            loading={loading}
+            refreshKey={demoRefresh}
+            onSelect={handleDemoSelect}
+          />
+
+          <hr className="border-slate-200 dark:border-slate-800" />
+
           <div className="flex gap-3">
             <button onClick={() => setMessages([])} className="flex-1 py-2 text-sm font-semibold rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-slate-600 dark:text-slate-300">
               Clear Chat
@@ -569,12 +684,13 @@ function MetricBox({ label, value }: { label: string, value: string | number }) 
 }
 
 function EvidencePanel({
-  meta, showEvidence, onShowPdf, onShowFigure, onShowTable
+  meta, showEvidence, onShowPdf, onShowFigure, onShowTable, targetDoc
 }: {
   meta: any, showEvidence: boolean,
   onShowPdf: (url: string) => void,
   onShowFigure?: (fig: any) => void,
   onShowTable?: (tbl: any) => void,
+  targetDoc?: string,
 }) {
   // Add onShowTable to the destructured props passed to sub-components
   const [open, setOpen] = useState(false);
@@ -655,6 +771,18 @@ function EvidencePanel({
   return (
     <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700/50">
 
+      <FactLockPanel
+        factLock={meta.fact_lock}
+        onViewPage={(page) => {
+          const docId = targetDoc ? targetDoc.replace(/\.(pdf|docx)$/i, "") : meta.documents_used?.[0];
+          if (docId) {
+            onShowPdf(`http://localhost:8000/document/file/${docId}.pdf#page=${page}`);
+          }
+        }}
+      />
+
+      <RiskRadar data={meta.risk_radar} />
+
       {/* Figure/Table in evidence - show quick view buttons */}
       {supporting.some((n: any) => n.image_data) && (
         <div className="mb-4 flex flex-wrap gap-2">
@@ -670,7 +798,7 @@ function EvidencePanel({
         </div>
       )}
 
-      {showEvidence && supporting.length > 0 && (
+      {showEvidence && supporting.length > 0 && !meta.risk_radar?.active && (
         <div className="mb-5">
           <div className="text-[10px] font-bold text-emerald-500 dark:text-emerald-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
             <Network className="w-3.5 h-3.5" />

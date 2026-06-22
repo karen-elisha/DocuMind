@@ -1,5 +1,34 @@
 @import "tailwindcss";
 
+@keyframes mm-node-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-16px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.mm-node-enter {
+  animation: mm-node-enter 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.mm-expand-btn-open {
+  transform: rotate(0deg);
+}
+
+/* React Flow: allow clicks on custom node controls */
+.react-flow__node {
+  overflow: visible !important;
+  pointer-events: all !important;
+}
+
+.react-flow__node .nopan {
+  pointer-events: all !important;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 :root {

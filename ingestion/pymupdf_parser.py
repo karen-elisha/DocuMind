@@ -257,6 +257,8 @@ def parse_document_pymupdf(
                         "source": "pymupdf",
                         "font_size": round(dominant_size, 1),
                         "section": section_for_elem,
+                        "bbox": [round(v, 2) for v in block["bbox"]],
+                        "page_height": round(page_height, 2),
                     },
                 })
                 text_count += 1

@@ -106,3 +106,23 @@ export async function listDocuments() {
   }
   return res.json();
 }
+
+export async function getDemoQuestions(docId: string) {
+  const res = await fetch(
+    `${API_URL}/demo/questions?doc_id=${encodeURIComponent(docId)}`,
+  );
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+export async function getDocumentMindmap(docId: string) {
+  const res = await fetch(
+    `${API_URL}/document/${encodeURIComponent(docId)}/mindmap`,
+  );
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}

@@ -5,6 +5,7 @@ import base64
 import io
 import sys
 import shutil
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
@@ -27,6 +28,11 @@ from retrieval.reranker import rerank, warm_reranker
 from generation.prompt_builder import build_prompt_from_fusion, build_prompt
 from generation.risk_detector import score_nodes, confidence_from_risk, calculate_confidence, score_text
 from generation.groq_client import chat
+from generation.fact_verifier import verify_answer
+from retrieval.risk_radar import build_risk_radar
+from demo_questions import get_demo_questions, set_demo_questions
+from generation.demo_question_generator import generate_demo_questions
+from ingestion.mindmap_builder import build_mindmap
 from visualization.graph_snapshot import GraphVisualizer
 
 kg = KnowledgeGraph()
@@ -221,9 +227,41 @@ def _build_insights(doc_id: str, parse_result: dict, vision_results: dict) -> di
         "tables": tables_data,
         "headings": headings_data,
         "extracted_text": grouped_text,
+        "mindmap": build_mindmap(
+            doc_id,
+            parse_result.get("document_name", doc_id),
+            elements,
+            img_list,
+            parse_result.get("pages_processed", 0),
+        ),
     }
     _DOCUMENT_INSIGHTS[doc_id] = insight
     return insight
+
+
+def _generate_and_store_demo_questions(doc_id: str, insight: dict) -> list[dict]:
+    """Generate tailored demo questions and attach to document insights."""
+    try:
+        if doc_id in _DOCUMENT_INSIGHTS:
+            _DOCUMENT_INSIGHTS[doc_id]["demo_questions_status"] = "generating"
+        questions = generate_demo_questions(doc_id, insight)
+        set_demo_questions(doc_id, questions, _DOCUMENT_INSIGHTS)
+        if doc_id in _DOCUMENT_INSIGHTS:
+            _DOCUMENT_INSIGHTS[doc_id]["demo_questions_status"] = "ready"
+        return questions
+    except Exception as exc:
+        print(f"[Upload] Demo question generation failed (non-fatal): {exc}")
+        if doc_id in _DOCUMENT_INSIGHTS:
+            _DOCUMENT_INSIGHTS[doc_id]["demo_questions_status"] = "failed"
+        return []
+
+
+def _generate_demo_questions_async(doc_id: str, insight: dict) -> None:
+    threading.Thread(
+        target=_generate_and_store_demo_questions,
+        args=(doc_id, insight),
+        daemon=True,
+    ).start()
 
 
 def _find_figure(doc_id: str, figure_number: str) -> dict | None:
@@ -324,8 +362,11 @@ async def upload_document(file: UploadFile = File(...)):
         except Exception as graph_exc:
             print(f"[Upload] Graph build failed (non-fatal): {graph_exc}")
 
-        # Build and cache document insights
-        _build_insights(doc_id, parse_result, vision_results)
+        # Build insights, then generate demo questions in background (non-blocking)
+        insight = _build_insights(doc_id, parse_result, vision_results)
+        insight["demo_questions"] = []
+        insight["demo_questions_status"] = "generating"
+        _generate_demo_questions_async(doc_id, insight)
 
         return {
             "filename": file.filename,
@@ -335,6 +376,7 @@ async def upload_document(file: UploadFile = File(...)):
             "graph_nodes": kg.node_count,
             "graph_edges": kg.edge_count,
             "stats": stats or {},
+            "demo_questions_status": "generating",
         }
 
     except Exception as e:
@@ -804,11 +846,20 @@ Sections/Headings:
             factual=prompt.get("factual", False),
         )
 
+        evidence_for_verify = list(filtered)
+        for bucket in ("exceptions", "contradictions", "risks", "warnings", "limitations", "qualifications"):
+            evidence_for_verify.extend(neg_result.get(bucket, []))
+
+        fact_lock = verify_answer(answer, evidence_for_verify)
+        risk_radar = build_risk_radar(filtered, neg_result, kg)
+
         return {
             "query": request.query,
             "cross_doc": request.cross_doc,
             "answer": answer,
             "confidence_score": round(confidence, 4),
+            "fact_lock": fact_lock,
+            "risk_radar": risk_radar,
             "evidence": {
                 "supporting":     enriched_supporting,
                 "exceptions":     neg_result.get("exceptions", []),
@@ -835,6 +886,17 @@ async def get_document_insights(doc_id: str):
     if not insight:
         raise HTTPException(status_code=404, detail=f"No insights found for doc_id '{doc_id}'. Ingest the document first.")
     return insight
+
+
+@app.get("/document/{doc_id}/mindmap")
+async def get_document_mindmap(doc_id: str):
+    insight = _DOCUMENT_INSIGHTS.get(doc_id)
+    if not insight:
+        raise HTTPException(status_code=404, detail=f"No mind map for '{doc_id}'. Ingest the document first.")
+    mindmap = insight.get("mindmap")
+    if not mindmap:
+        raise HTTPException(status_code=404, detail=f"Mind map not built for '{doc_id}'.")
+    return mindmap
 
 
 @app.get("/document/{doc_id}/figure/{figure_number}")
@@ -939,6 +1001,21 @@ async def delete_document(filename: str):
     doc_id = os.path.splitext(filename)[0]
     _DOCUMENT_INSIGHTS.pop(doc_id, None)
     return {"filename": filename, "status": "deleted"}
+
+
+@app.get("/demo/questions")
+async def demo_questions(doc_id: str | None = None):
+    """Demo questions generated at ingest for the given document."""
+    if not doc_id:
+        return {"questions": [], "doc_id": None, "status": "empty"}
+    insight = _DOCUMENT_INSIGHTS.get(doc_id, {})
+    questions = get_demo_questions(doc_id, _DOCUMENT_INSIGHTS)
+    status = insight.get("demo_questions_status", "ready" if questions else "empty")
+    if not questions and status not in ("generating", "failed"):
+        if insight:
+            _generate_demo_questions_async(doc_id, insight)
+            status = "generating"
+    return {"questions": questions, "doc_id": doc_id, "status": status}
 
 
 @app.get("/documents")
