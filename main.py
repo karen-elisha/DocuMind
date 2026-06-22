@@ -5,6 +5,7 @@ import base64
 import io
 import sys
 import shutil
+from contextlib import asynccontextmanager
 from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
@@ -21,10 +22,8 @@ from ingestion.node_builder import run_ingestion_pipeline
 from graph.graph_engine import KnowledgeGraph
 from graph.positive_expansion import PositiveExpander
 from graph.negative_expansion import NegativeExpander
-from retrieval.hybrid_search import HybridRetriever
-from retrieval.evidence_fusion import fuse_evidence
-from retrieval.query_expansion import expand_query
-from retrieval.reranker import rerank
+from retrieval.hybrid_search import retrieve_candidates, close_shared_client, warm_retrieval
+from retrieval.reranker import rerank, warm_reranker
 from generation.prompt_builder import build_prompt_from_fusion, build_prompt
 from generation.risk_detector import score_nodes, confidence_from_risk, calculate_confidence, score_text
 from generation.groq_client import chat
@@ -41,10 +40,24 @@ os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
 
 _DOCUMENT_INSIGHTS: dict[str, dict] = {}
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Pre-load ML models and Weaviate connection so first query is fast."""
+    try:
+        warm_reranker()
+        warm_retrieval()
+    except Exception as exc:
+        print(f"[Startup] Model warmup failed (non-fatal): {exc}")
+    yield
+    close_shared_client()
+
+
 app = FastAPI(
     title="DocuMind Graph API",
     description="Agentic KG-RAG with Negative Graph Expansion",
     version="2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -555,7 +568,11 @@ Sections/Headings:
                     overall_risk_level="None",
                     cross_doc=request.cross_doc,
                 )
-                answer = chat(prompt["user"], system=prompt["system"])
+                answer = chat(
+                    prompt["user"],
+                    system=prompt["system"],
+                    factual=prompt.get("factual", False),
+                )
             else:
                 answer = ""
 
@@ -577,23 +594,15 @@ Sections/Headings:
                 "documents_used": [request.doc_id] if request.doc_id else [],
             }
 
-        # ── Step 1: Query Expansion ────────────────────────────────────
-        query_variants = expand_query(request.query)
+        # ── Step 1+2: Adaptive hybrid retrieval (shared connection) ────
+        all_candidates = retrieve_candidates(
+            request.query,
+            doc_id=request.doc_id,
+            cross_doc=request.cross_doc,
+        )
 
-        # ── Step 2: Hybrid Search (top_k=50, alpha=1.0 + alpha=0.0) ────
-        all_candidates: list[dict] = []
-        seen_ids: set = set()
-        for qv in query_variants:
-            hybrid_results = HybridRetriever().retrieve(query=qv, doc_id=request.doc_id, cross_doc=request.cross_doc)
-            for n in hybrid_results.get("semantic_results", []) + hybrid_results.get("keyword_results", []):
-                nid = n.get("node_id")
-                if nid and nid not in seen_ids:
-                    seen_ids.add(nid)
-                    all_candidates.append(n)
-
-        # ── Step 3: Cross-Encoder Reranking ─────────────────────────────
-        # Uses sigmoid-normalized scores + metadata-aware content
-        reranked = rerank(request.query, all_candidates, top_k=20)
+        # ── Step 3: Cross-Encoder Reranking (prefiltered pool) ─────────
+        reranked = rerank(request.query, all_candidates)
 
         # ── Step 4: Noise Removal ───────────────────────────────────────
         def _is_noise(node: dict) -> bool:
@@ -635,31 +644,6 @@ Sections/Headings:
                 seen_hashes.add(chash)
             deduped.append(n)
         filtered = deduped
-
-        # ── Step 7: Evidence Validation (retry once if top chunks are weak) ──
-        needs_retry = False
-        if filtered:
-            top_scores = [n.get("_rerank_score", 0) for n in filtered[:3] if n.get("_rerank_score") is not None]
-            avg_top = sum(top_scores) / len(top_scores) if top_scores else 0.0
-            if avg_top < 0.08:
-                needs_retry = True
-
-        if needs_retry:
-            retry_variants = [f"{request.query} about"] if request.doc_id else [request.query]
-            retry_candidates: list[dict] = []
-            seen_ids_r: set = set()
-            for qv in retry_variants:
-                hr = HybridRetriever().retrieve(query=qv, doc_id=request.doc_id, cross_doc=request.cross_doc)
-                for n in hr.get("semantic_results", []) + hr.get("keyword_results", []):
-                    nid = n.get("node_id")
-                    if nid and nid not in seen_ids_r:
-                        seen_ids_r.add(nid)
-                        retry_candidates.append(n)
-            if retry_candidates:
-                reranked2 = rerank(request.query, retry_candidates, top_k=20)
-                filtered2 = [n for n in reranked2 if not _is_noise(n)]
-                if filtered2:
-                    filtered = filtered2
 
         # ── Graph expansion (for evidence panel only, NOT for confidence) ──
         seed_ids = [
@@ -814,7 +798,11 @@ Sections/Headings:
             overall_risk_level=overall_risk,
             cross_doc=request.cross_doc,
         )
-        answer = chat(prompt["user"], system=prompt["system"])
+        answer = chat(
+            prompt["user"],
+            system=prompt["system"],
+            factual=prompt.get("factual", False),
+        )
 
         return {
             "query": request.query,

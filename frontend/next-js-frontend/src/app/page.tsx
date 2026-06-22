@@ -15,6 +15,7 @@ import dynamic from "next/dynamic";
 import DocumentInsights from "@/components/DocumentInsights";
 import FigureViewer from "@/components/FigureViewer";
 import TableViewer from "@/components/TableViewer";
+import MarkdownMessage from "@/components/MarkdownMessage";
 
 const DynamicForceGraph = dynamic(() => import("@/components/ForceGraphView"), {
   ssr: false,
@@ -391,9 +392,7 @@ export default function Workspace() {
                               ? 'bg-slate-100 dark:bg-slate-800/80 border-slate-200 dark:border-slate-700 rounded-br-sm'
                               : 'bg-white dark:bg-[#111827] border-slate-200 dark:border-slate-800 rounded-bl-sm shadow-md'
                           }`}>
-                            <div className="prose dark:prose-invert max-w-none text-sm leading-relaxed whitespace-pre-wrap">
-                              {msg.content}
-                            </div>
+                            <MarkdownMessage content={msg.content} />
                             {msg.role === 'assistant' && msg.meta && (
                               <EvidencePanel
                                 meta={msg.meta}

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import requests
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
-from groq import Groq
 
 from config import Config
 
@@ -17,11 +17,12 @@ class VisionSummary:
     summary: str
 
 
-def _build_groq_client() -> Groq:
-    api_key = getattr(Config, "GROQ_API_KEY", "") or ""
+def _get_nvidia_vision_key() -> str:
+    api_key = getattr(Config, "NVIDIA_API_KEY_VISION", "") or ""
+    # If missing, raise early so ingestion runner can report properly.
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not set. Cannot run vision processing.")
-    return Groq(api_key=api_key)
+        raise RuntimeError("NVIDIA_API_KEY_VISION is not set. Cannot run vision processing.")
+    return api_key
 
 
 _VISION_SYSTEM_PROMPT = """You are an expert scientific document analyst.
@@ -95,9 +96,27 @@ def summarize_images(
     model: Optional[str] = None,
     max_images: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    client = _build_groq_client()
+    """
+    Task 2 Vision Processing
+
+    Requirements:
+    - Read extracted images (from parser output)
+    - Use NVIDIA Vision model
+    - Generate concise semantic descriptions suitable for retrieval
+
+    Returns:
+      {
+        "<image_element_id or synthetic_id>": {
+            "page": int,
+            "image_path": str,
+            "vision_summary": str
+        },
+        ...
+      }
+    """
+    api_key = _get_nvidia_vision_key()
     if model is None:
-        model = getattr(Config, "GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+        model = "meta/llama-3.2-11b-vision-instruct"
 
     results: Dict[str, Dict[str, Any]] = {}
 
@@ -121,38 +140,40 @@ def summarize_images(
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
 
+        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _VISION_SYSTEM_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        },
+                    ]
+                }
+            ],
+            "max_tokens": 500,
+            "temperature": 0.2,
+            "top_p": 1.00,
+            "stream": False
+        }
+        
         try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": _VISION_SYSTEM_PROMPT},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.2,
-                max_tokens=500,
-                response_format={"type": "json_object"},
-            )
-
-            raw = ""
-            try:
-                raw = completion.choices[0].message.content.strip()
-            except Exception:
-                raw = ""
-
+            response = requests.post(invoke_url, headers=headers, json=payload)
+            response_data = response.json()
+            raw = response_data["choices"][0]["message"]["content"].strip()
+            
             parsed = _parse_vision_response(raw)
 
             summary_text = parsed.get("summary", "")
-            if not summary_text:
-                parsed = _parse_vision_response(raw)
-                summary_text = parsed.get("summary", "")
             if not summary_text:
                 summary_text = f"[Figure {parsed.get('figure_number', '')}] {parsed.get('title', '') or parsed.get('chart_type', '') or 'diagram'}. {parsed.get('conclusion', '') or ''}"
 
