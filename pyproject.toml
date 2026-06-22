@@ -24,4 +24,6 @@ dependencies = [
     "uvicorn>=0.22.0",
     "pymupdf>=1.23.0",
     "weaviate-client>=4.5.0",
+    "openai>=2.43.0",
+    "requests>=2.34.2",
 ]

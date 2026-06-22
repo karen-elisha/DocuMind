@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import base64
+import requests
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
-from groq import Groq
 
 from config import Config
 
@@ -16,17 +17,77 @@ class VisionSummary:
     summary: str
 
 
-def _build_groq_client() -> Groq:
-    api_key = getattr(Config, "GROQ_API_KEY", "") or ""
+def _get_nvidia_vision_key() -> str:
+    api_key = getattr(Config, "NVIDIA_API_KEY_VISION", "") or ""
     # If missing, raise early so ingestion runner can report properly.
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not set. Cannot run vision processing.")
-    return Groq(api_key=api_key)
+        raise RuntimeError("NVIDIA_API_KEY_VISION is not set. Cannot run vision processing.")
+    return api_key
 
 
-def _is_probably_diagram_prompt(s: str) -> str:
-    # Kept for future heuristics; currently unused.
-    return s
+_VISION_SYSTEM_PROMPT = """You are an expert scientific document analyst.
+
+Analyze the image in detail and produce a thorough 150-300 word explanation.
+
+For every image:
+1. Identify figure number if visible.
+2. Read and interpret any caption.
+3. Analyze chart/diagram/figure type.
+4. Explain relationships between elements.
+5. Identify axes labels, units, scales.
+6. Identify trends, increases, decreases, peaks, anomalies.
+7. Identify key conclusions and scientific significance.
+
+If scientific graph/chart:
+- Explain the trend (rising, falling, cyclic, etc.)
+- Identify variables (x-axis, y-axis, units)
+- Note specific data points, peaks, valleys
+- Explain what the trend means scientifically
+
+If architecture/workflow diagram:
+- Explain components and their roles
+- Explain the flow / sequence
+- Explain data or control flow between components
+
+If table screenshot:
+- Extract key values and relationships
+- Summarize findings across rows/columns
+
+Return valid JSON only with this exact structure:
+{
+  "figure_number": "",
+  "chart_type": "",
+  "title": "",
+  "axes": "",
+  "summary": "150-300 word detailed analysis",
+  "observations": ["observation 1", "observation 2", "observation 3"],
+  "conclusion": "key conclusion"
+}
+Do not return generic descriptions like 'the image shows a graph'. Be specific and detailed."""
+
+
+def _parse_vision_response(text: str) -> dict:
+    """Try to parse JSON from the vision model response."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try to extract JSON from markdown code block
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 def summarize_images(
@@ -40,7 +101,7 @@ def summarize_images(
 
     Requirements:
     - Read extracted images (from parser output)
-    - Use Groq Vision model
+    - Use NVIDIA Vision model
     - Generate concise semantic descriptions suitable for retrieval
 
     Returns:
@@ -53,9 +114,9 @@ def summarize_images(
         ...
       }
     """
-    client = _build_groq_client()
+    api_key = _get_nvidia_vision_key()
     if model is None:
-        model = getattr(Config, "GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+        model = "meta/llama-3.2-11b-vision-instruct"
 
     results: Dict[str, Dict[str, Any]] = {}
 
@@ -70,63 +131,64 @@ def summarize_images(
         if not image_path or not os.path.exists(image_path):
             continue
 
-        # We may not have a stable image_element_id from parser; use a synthetic key if needed.
         image_key = img.get("image_element_id") or f"image_{idx}_p{page}"
 
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
-        # Groq vision expects base64 in many SDK examples; the Groq python client
-        # accepts file-like payloads depending on model. To stay robust, we pass
-        # base64 via the required structure.
         import base64
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        prompt = (
-            "You are a document vision analyst for building retrieval nodes.\n"
-            "Provide a concise semantic description (1-3 sentences) of what the image shows.\n\n"
-            "Focus on:\n"
-            "- architecture diagrams, workflow diagrams (entities + arrows)\n"
-            "- charts/graphs (metrics + trends)\n"
-            "- graphs/figures (key components + relationships)\n"
-            "\n"
-            "Output format: a single sentence description suitable for semantic retrieval.\n"
-        )
-
-        # Use Groq chat completion with vision content.
-        # Model name is based on the repo plan; can be overridden via `model`.
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
+        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": _VISION_SYSTEM_PROMPT},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:image/png;base64,{b64}"},
                         },
-                    ],
+                    ]
                 }
             ],
-            temperature=0.2,
-            max_tokens=180,
-        )
-
-        summary_text = ""
-        try:
-            summary_text = completion.choices[0].message.content.strip()
-        except Exception:
-            summary_text = ""
-
-        if not summary_text:
-            summary_text = "Figure/diagram detected, but no description could be generated."
-
-        results[image_key] = {
-            "page": page,
-            "image_path": image_path,
-            "vision_summary": summary_text,
+            "max_tokens": 500,
+            "temperature": 0.2,
+            "top_p": 1.00,
+            "stream": False
         }
+        
+        try:
+            response = requests.post(invoke_url, headers=headers, json=payload)
+            response_data = response.json()
+            raw = response_data["choices"][0]["message"]["content"].strip()
+            
+            parsed = _parse_vision_response(raw)
+
+            summary_text = parsed.get("summary", "")
+            if not summary_text:
+                summary_text = f"[Figure {parsed.get('figure_number', '')}] {parsed.get('title', '') or parsed.get('chart_type', '') or 'diagram'}. {parsed.get('conclusion', '') or ''}"
+
+            results[image_key] = {
+                "page": page,
+                "image_path": image_path,
+                "vision_summary": summary_text,
+                "vision_detail": parsed,
+            }
+        except Exception:
+            results[image_key] = {
+                "page": page,
+                "image_path": image_path,
+                "vision_summary": f"[Image page {page}] {img.get('caption', 'image')}",
+                "vision_detail": {},
+            }
 
     return results

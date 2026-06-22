@@ -6,6 +6,8 @@ load_dotenv()
 
 class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    NVIDIA_API_KEY_VISION = os.getenv("NVIDIA_API_KEY_VISION", "")
+    NVIDIA_API_KEY_CHAT = os.getenv("NVIDIA_API_KEY_CHAT", "")
     # Groq models
     GROQ_VISION_MODEL = os.getenv(
         "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -23,14 +25,18 @@ class Config:
     # Alias for backward compatibility with integration-branch code
     WEAVIATE_COLLECTION_NAME = WEAVIATE_COLLECTION
 
-    # Embeddings
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    # Embeddings — bge-small matches MiniLM dims (384) but retrieves facts better
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
     # Alias for backward compatibility with integration-branch code
     WEAVIATE_EMBEDDING_MODEL = os.getenv("WEAVIATE_EMBEDDING_MODEL", EMBEDDING_MODEL)
 
-    # Chunking config (character-based)
-    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
-    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+    # Chunking config (character-based) — smaller chunks improve factual precision
+    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
+    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+
+    # Docling parser limits
+    MAX_DOCLING_PAGES = int(os.getenv("MAX_DOCLING_PAGES", "30"))
+    DOCLING_TIMEOUT = int(os.getenv("DOCLING_TIMEOUT", "120"))  # seconds
 
     # Feature flags (dev-speed defaults: false)
     ENABLE_VISION = os.getenv("ENABLE_VISION", "false").lower() == "true"
@@ -40,6 +46,13 @@ class Config:
     # Docling pipeline controls
     ENABLE_OCR = os.getenv("ENABLE_OCR", "false").lower() == "true"
     ENABLE_TABLE_STRUCTURE = os.getenv("ENABLE_TABLE_STRUCTURE", "true").lower() == "true"
+
+    # Retrieval performance tuning
+    RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "30"))
+    RERANK_POOL_SIZE = int(os.getenv("RERANK_POOL_SIZE", "35"))
+    RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
+    RETRIEVAL_STRONG_SCORE = float(os.getenv("RETRIEVAL_STRONG_SCORE", "0.82"))
+    RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "512"))
 
     # Ingestion & data storage directories
     UPLOADS_DIR = os.path.join(os.getcwd(), "data", "uploads")

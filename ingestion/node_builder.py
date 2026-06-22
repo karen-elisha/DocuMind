@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -12,6 +14,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from config import Config
 from vectorstore.weaviate_client import DocuMindWeaviateClient
+from ingestion.fact_extractor import detect_section_from_text, extract_fact_sentences, is_toc_noise
 
 
 # ---- Timer ----
@@ -33,7 +36,10 @@ class Timer:
 
 # ---- Node/chunk data model ----
 
-SUPPORTED_NODE_TYPES = {"heading", "paragraph", "table", "image", "caption", "footnote", "list_item", "formula"}
+SUPPORTED_NODE_TYPES = {
+    "heading", "paragraph", "table", "table_row", "image", "caption",
+    "footnote", "list_item", "formula", "fact",
+}
 
 MERGEABLE_TYPES = {"paragraph", "list_item"}
 MIN_CONTENT_LEN = 80  # merge fragments shorter than this into the next sibling
@@ -53,6 +59,75 @@ class Node:
 
 def _node_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+def _stable_chunk_id(doc_id: str, page: int, chunk_type: str, content: str) -> str:
+    key = f"{doc_id}:{page}:{chunk_type}:{content[:400]}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _resolve_section(metadata: Dict[str, Any], current_heading: str) -> str:
+    meta_sec = str(metadata.get("section") or "").strip()
+    inline = detect_section_from_text(str(metadata.get("raw_content") or metadata.get("content") or ""))
+    if inline:
+        return inline
+    if meta_sec and re.search(r"\bItem\s+\d", meta_sec, re.IGNORECASE) and not is_toc_noise(meta_sec):
+        return meta_sec
+    if current_heading and not re.search(
+        r"table of contents|item 15|item 16|signatures|exhibits|available information",
+        current_heading,
+        re.IGNORECASE,
+    ):
+        return current_heading
+    return meta_sec or current_heading
+
+
+def _enrich_chunk_content(content: str, metadata: Dict[str, Any], document_name: str = "") -> str:
+    """Prepend section/document context so embeddings and BM25 hit declarative facts."""
+    section = _resolve_section(metadata, metadata.get("parent_heading") or "")
+    if not section or re.search(r"SECURITIES AND EXCHANGE COMMISSION", section, re.IGNORECASE):
+        inline = re.match(r"^(Item\s+\d+[A-Z]?\.?\s[^\n.]{0,80})", content.strip(), re.IGNORECASE)
+        if inline:
+            section = inline.group(1).strip()
+        elif re.search(r"\bresearch and development\b", content, re.IGNORECASE):
+            section = "Research and Development"
+        elif re.search(r"\bBusiness Segments\b", content):
+            section = "Business Segments"
+        elif re.search(r"\bSelected Financial Data\b", content, re.IGNORECASE):
+            section = "Selected Financial Data"
+    parts: List[str] = []
+    if document_name:
+        parts.append(f"[Document: {document_name}]")
+    if section:
+        parts.append(f"[Section: {section}]")
+    if not parts:
+        return content
+    return " ".join(parts) + "\n" + content
+
+
+def _make_chunk(
+    *,
+    doc_id: str,
+    document_name: str,
+    page: int,
+    chunk_type: str,
+    content: str,
+    metadata: Dict[str, Any],
+    source_node_id: str,
+) -> Dict[str, Any]:
+    section = _resolve_section(metadata, metadata.get("parent_heading") or "")
+    enriched = _enrich_chunk_content(content, {**metadata, "parent_heading": section}, document_name)
+    chunk_id = _stable_chunk_id(doc_id, page, chunk_type, content)
+    return {
+        "chunk_id": chunk_id,
+        "node_id": chunk_id,
+        "doc_id": doc_id,
+        "page": page,
+        "type": chunk_type,
+        "section": section,
+        "content": enriched,
+        "metadata": {**metadata, "raw_content": content, "section": section},
+    }
 
 
 def _safe_int(x: Any, default: int = 1) -> int:
@@ -118,13 +193,18 @@ def _merge_short_nodes(nodes: List[Node]) -> List[Node]:
 _embeddings_instance = None
 
 
-def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
+def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings | None:
     global _embeddings_instance
     if _embeddings_instance is None:
         print(f"[Embeddings] Loading model: {model_name}")
         t0 = time.perf_counter()
-        _embeddings_instance = HuggingFaceEmbeddings(model_name=model_name)
-        print(f"[Embeddings] Model loaded in {time.perf_counter()-t0:.2f}s")
+        try:
+            _embeddings_instance = HuggingFaceEmbeddings(model_name=model_name)
+            print(f"[Embeddings] Model loaded in {time.perf_counter()-t0:.2f}s")
+        except Exception as exc:
+            print(f"[Embeddings] FAILED to load model: {exc}")
+            print("[Embeddings] Continuing without local embeddings. Weaviate will use its own vectorizer or keyword search.")
+            _embeddings_instance = None  # sentinel so we don't retry
     return _embeddings_instance
 
 
@@ -167,16 +247,28 @@ def build_nodes(
             type=el_type,
             content=content.strip(),
             metadata=metadata,
+            section=str(metadata.get("section") or ""),
         )
 
         if el_type == "image":
             summary = ""
+            fig_num = metadata.get("figure_number", "")
+            fig_cap = metadata.get("figure_caption", "") or metadata.get("caption", "")
             for v in vision_results.values():
                 if int(v.get("page") or 1) == page and v.get("vision_summary"):
                     summary = v["vision_summary"]
                     break
-            node.content = summary.strip() if summary else ""
+            # Build content: prefix with [Figure N] for keyword search, then vision or caption
+            prefix = f"[Figure {fig_num}] " if fig_num else ""
+            if summary.strip():
+                node.content = f"{prefix}{summary.strip()}"
+            elif fig_cap:
+                node.content = f"{prefix}{fig_cap}"
+            else:
+                node.content = f"{prefix}image on page {page}".strip() if prefix else f"image on page {page}"
             node.metadata["image_vision_available"] = bool(summary)
+            node.metadata["figure_number"] = fig_num
+            node.metadata["figure_caption"] = fig_cap
 
         if el_type == "caption":
             node.metadata.setdefault("links_to_image", True)
@@ -193,18 +285,29 @@ def build_nodes(
         img_path = img.get("image_path")
         page = _safe_int(img.get("page"), 1)
         summary = image_summaries_by_path.get(img_path, "")
+        fig_num = img.get("figure_number", "")
+        fig_cap = img.get("caption", "")
         if not any(n.type == "image" and n.page == page and (n.metadata.get("image_path") == img_path) for n in nodes):
+            prefix = f"[Figure {fig_num}] " if fig_num else ""
+            if summary.strip():
+                content = f"{prefix}{summary.strip()}"
+            elif fig_cap:
+                content = f"{prefix}{fig_cap}"
+            else:
+                content = f"{prefix}image on page {page}".strip() if prefix else f"image on page {page}"
             nodes.append(
                 Node(
                     node_id=_node_id("image"),
                     doc_id=doc_id,
                     page=page,
                     type="image",
-                    content=(summary or "").strip(),
+                    content=content,
                     metadata={
                         "image_path": img_path,
                         "source": "docling_export_to_images",
                         "vision_summary_available": bool(summary),
+                        "figure_number": fig_num,
+                        "figure_caption": fig_cap,
                     },
                 )
             )
@@ -217,6 +320,7 @@ def build_nodes(
             "type": n.type,
             "content": n.content,
             "metadata": n.metadata,
+            "section": n.section or n.metadata.get("section", ""),
         }
         for n in nodes
     ]
@@ -229,8 +333,6 @@ def build_nodes(
     }
 
 
-# ---- Chunking ----
-
 def chunk_nodes(
     node_build: Dict[str, Any],
     *,
@@ -242,14 +344,66 @@ def chunk_nodes(
     if chunk_overlap is None:
         chunk_overlap = int(getattr(Config, "CHUNK_OVERLAP", 150))
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", " ", ""],
-    )
-
     nodes = node_build.get("nodes", [])
+    document_name = str(node_build.get("document_name") or node_build.get("doc_id") or "")
+    doc_id = str(node_build.get("doc_id") or "")
     chunks: List[Dict[str, Any]] = []
+
+    current_heading = ""
+    buffer_content = []
+    buffer_len = 0
+    buffer_nodes = []
+
+    def flush_buffer():
+        nonlocal buffer_content, buffer_len, buffer_nodes
+        if not buffer_content:
+            return
+        combined_content = "\n\n".join(buffer_content)
+        first_node = buffer_nodes[0]
+        first_meta = dict(first_node.get("metadata") or {})
+        resolved = _resolve_section(first_meta, current_heading)
+        base_metadata = dict(first_meta)
+        base_metadata.update({
+            "node_id": first_node.get("node_id"),
+            "node_type": "text_chunk",
+            "doc_id": first_node.get("doc_id"),
+            "page": first_node.get("page"),
+            "parent_heading": resolved,
+            "section": resolved,
+        })
+        
+        # If the combined content is extremely large, use text splitter. Otherwise keep together.
+        if len(combined_content) > chunk_size * 1.5:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size, 
+                chunk_overlap=chunk_overlap,
+                separators=["\n\n", "\n", ". ", " ", ""]
+            )
+            docs = splitter.create_documents([combined_content], metadatas=[base_metadata])
+            for doc in docs:
+                chunks.append(_make_chunk(
+                    doc_id=doc_id,
+                    document_name=document_name,
+                    page=int(first_node.get("page") or 1),
+                    chunk_type="text_chunk",
+                    content=doc.page_content,
+                    metadata=doc.metadata,
+                    source_node_id=str(first_node.get("node_id") or ""),
+                ))
+        else:
+            chunks.append(_make_chunk(
+                doc_id=doc_id,
+                document_name=document_name,
+                page=int(first_node.get("page") or 1),
+                chunk_type="text_chunk",
+                content=combined_content,
+                metadata=base_metadata,
+                source_node_id=str(first_node.get("node_id") or ""),
+            ))
+        
+        buffer_content = []
+        buffer_len = 0
+        buffer_nodes = []
 
     for node in nodes:
         ntype = node.get("type")
@@ -260,78 +414,85 @@ def chunk_nodes(
             continue
 
         base_metadata = dict(node.get("metadata") or {})
+        resolved = _resolve_section(base_metadata, current_heading)
         base_metadata.update(
             {
                 "node_id": node.get("node_id"),
                 "node_type": ntype,
                 "doc_id": node.get("doc_id"),
                 "page": node.get("page"),
+                "parent_heading": resolved,
+                "section": resolved,
             }
         )
 
-        if ntype == "table":
-            if len(content) <= (chunk_size + chunk_overlap):
-                chunks.append(
-                    {
-                        "chunk_id": _node_id("chunk"),
-                        "node_id": node.get("node_id"),
-                        "doc_id": node.get("doc_id"),
-                        "page": node.get("page"),
-                        "type": ntype,
-                        "content": content,
-                        "metadata": base_metadata,
-                    }
-                )
-            else:
-                lines = content.splitlines()
-                buf = []
-                for line in lines:
-                    if sum(len(x) for x in buf) > chunk_size:
-                        chunk_content = "\n".join(buf).strip()
-                        if chunk_content:
-                            chunks.append(
-                                {
-                                    "chunk_id": _node_id("chunk"),
-                                    "node_id": node.get("node_id"),
-                                    "doc_id": node.get("doc_id"),
-                                    "page": node.get("page"),
-                                    "type": ntype,
-                                    "content": chunk_content,
-                                    "metadata": base_metadata,
-                                }
-                            )
-                        buf = [line]
-                    else:
-                        buf.append(line)
-                if buf:
-                    chunk_content = "\n".join(buf).strip()
-                    if chunk_content:
-                        chunks.append(
-                            {
-                                "chunk_id": _node_id("chunk"),
-                                "node_id": node.get("node_id"),
-                                "doc_id": node.get("doc_id"),
-                                "page": node.get("page"),
-                                "type": ntype,
-                                "content": chunk_content,
-                                "metadata": base_metadata,
-                            }
-                        )
-            continue
+        if ntype == "heading":
+            flush_buffer()
+            current_heading = content
+            chunks.append(_make_chunk(
+                doc_id=doc_id,
+                document_name=document_name,
+                page=int(node.get("page") or 1),
+                chunk_type=ntype,
+                content=content,
+                metadata=base_metadata,
+                source_node_id=str(node.get("node_id") or ""),
+            ))
+        elif ntype in ("table", "table_row", "image", "formula", "caption", "fact"):
+            flush_buffer()
+            chunks.append(_make_chunk(
+                doc_id=doc_id,
+                document_name=document_name,
+                page=int(node.get("page") or 1),
+                chunk_type=ntype,
+                content=content,
+                metadata=base_metadata,
+                source_node_id=str(node.get("node_id") or ""),
+            ))
+        else:
+            if buffer_len + len(content) > chunk_size and buffer_len > 0:
+                flush_buffer()
+            buffer_content.append(content)
+            buffer_len += len(content)
+            buffer_nodes.append(node)
 
-        split_docs = splitter.create_documents([content], metadatas=[base_metadata])
-        for doc in split_docs:
-            chunks.append(
-                {
-                    "chunk_id": _node_id("chunk"),
-                    "node_id": node.get("node_id"),
-                    "doc_id": node.get("doc_id"),
-                    "page": node.get("page"),
-                    "type": ntype,
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                }
-            )
+    flush_buffer()
+
+    # Extract atomic fact sentences from paragraph/text chunks for precise retrieval
+    fact_chunks: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        if chunk.get("type") not in ("text_chunk", "paragraph", "table"):
+            continue
+        raw = chunk.get("metadata", {}).get("raw_content") or chunk.get("content", "")
+        # Strip enrichment prefix for fact extraction
+        if "[Section:" in raw:
+            raw = raw.split("\n", 1)[-1] if "\n" in raw else raw
+        facts = extract_fact_sentences(
+            raw,
+            page=int(chunk.get("page") or 1),
+            section=str(chunk.get("section") or ""),
+            doc_id=doc_id,
+            source_node_id=str(chunk.get("node_id") or ""),
+        )
+        for fact in facts:
+            fact_meta = dict(fact.get("metadata") or {})
+            fact_chunks.append(_make_chunk(
+                doc_id=doc_id,
+                document_name=document_name,
+                page=int(fact.get("page") or 1),
+                chunk_type="fact",
+                content=fact["content"],
+                metadata=fact_meta,
+                source_node_id=str(chunk.get("node_id") or ""),
+            ))
+
+    # Deduplicate facts against existing chunks by content hash
+    existing_content = {c.get("metadata", {}).get("raw_content", c.get("content", ""))[:200] for c in chunks}
+    for fc in fact_chunks:
+        raw = fc.get("metadata", {}).get("raw_content", "")
+        if raw[:200] not in existing_content:
+            chunks.append(fc)
+            existing_content.add(raw[:200])
 
     return {
         "doc_id": node_build.get("doc_id"),
@@ -359,6 +520,10 @@ def embed_chunks(
 
     embeddings = _get_embeddings(embedding_model_name)
 
+    if embeddings is None:
+        print("[Embeddings] Skipping embedding generation (model unavailable)")
+        return {**chunked, "embedded": False}
+
     texts = [c["content"] for c in chunks]
     vectors = embeddings.embed_documents(texts)
 
@@ -382,7 +547,13 @@ def store_chunks_weaviate(
         collection_name = getattr(Config, "WEAVIATE_COLLECTION", "DocuMindNode")
     chunks = chunked_embedded.get("chunks", [])
     weaviate = DocuMindWeaviateClient(collection_name=collection_name)
+    doc_id = chunked_embedded.get("doc_id")
+    if doc_id:
+        deleted = weaviate.delete_by_doc_id(str(doc_id))
+        if deleted:
+            print(f"[Weaviate] Removed {deleted} existing chunks for doc_id={doc_id}")
     weaviate.upsert_nodes(chunks)
+    weaviate.close()
     return {"stored": True, "count": len(chunks)}
 
 
@@ -400,7 +571,7 @@ def _print_summary(
     for name, sec in timings.items():
         pct = (sec / total * 100) if total > 0 else 0
         print(f"  {name:22s}  {sec:.2f}s  ({pct:5.1f}%)")
-    print(f"  {'─' * 35}")
+    print(f"  {'-' * 35}")
     print(f"  {'Total':22s}  {total:.2f}s  (100%)")
     print()
     parts = [f"{k}={v}" for k, v in stats.items() if v is not None]
@@ -449,17 +620,26 @@ def run_ingestion_pipeline(
 
     stored = {"stored": False, "count": 0}
     if enable_embeddings:
-        with Timer("Embeddings") as t:
-            embedded = embed_chunks(chunked)
-        timings["embeddings"] = t.elapsed
+        try:
+            with Timer("Embeddings") as t:
+                embedded = embed_chunks(chunked)
+            timings["embeddings"] = t.elapsed
+        except Exception as exc:
+            print(f"[Pipeline] Embeddings failed with exception: {exc}")
+            embedded = {**chunked, "embedded": False}
+            timings["embeddings"] = 0.0
     else:
         embedded = chunked
         timings["embeddings"] = 0.0
 
     if enable_weaviate:
-        with Timer("Weaviate Storage") as t:
-            stored = store_chunks_weaviate(embedded, collection_name=weaviate_collection)
-        timings["weaviate"] = t.elapsed
+        try:
+            with Timer("Weaviate Storage") as t:
+                stored = store_chunks_weaviate(embedded, collection_name=weaviate_collection)
+            timings["weaviate"] = t.elapsed
+        except Exception as exc:
+            print(f"[Pipeline] Weaviate storage failed with exception: {exc}")
+            timings["weaviate"] = 0.0
     else:
         timings["weaviate"] = 0.0
 
