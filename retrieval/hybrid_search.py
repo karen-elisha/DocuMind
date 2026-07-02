@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
@@ -96,11 +97,15 @@ def _search_pair(
     """Run semantic + BM25 in parallel, return fused results."""
     filter_doc_id = None if cross_doc else doc_id
 
+    # Use a higher limit for table queries so multiple tables land in the same batch
+    _is_table_query = bool(re.search(r'\btable\b|\bsegment\b|\bgoodwill\b|\brevenue\b|\bsales\b', query, re.I))
+    effective_limit = min(limit * 2, 60) if _is_table_query else limit
+
     def _semantic():
-        return client.hybrid_search(query=query, limit=limit, doc_id=filter_doc_id, alpha=1.0)
+        return client.hybrid_search(query=query, limit=effective_limit, doc_id=filter_doc_id, alpha=1.0)
 
     def _keyword():
-        return client.hybrid_search(query=query, limit=limit, doc_id=filter_doc_id, alpha=0.0)
+        return client.hybrid_search(query=query, limit=effective_limit, doc_id=filter_doc_id, alpha=0.0)
 
     sem_future = _executor.submit(_semantic)
     kw_future = _executor.submit(_keyword)
@@ -108,9 +113,22 @@ def _search_pair(
     keyword_results = kw_future.result()
 
     if not semantic_results and not keyword_results and not cross_doc and doc_id:
-        semantic_results = client.fetch_all(doc_id=doc_id, limit=limit)
+        semantic_results = client.fetch_all(doc_id=doc_id, limit=effective_limit)
 
-    return _reciprocal_rank_fusion(semantic_results, keyword_results, query)
+    fused = _reciprocal_rank_fusion(semantic_results, keyword_results, query)
+
+    # Boost table chunks that share a row_header token with the query
+    # so "Industrial" in Note 3 and Item 7 both surface together
+    query_tokens = set(re.findall(r'[A-Za-z][a-z]+', query))
+    for c in fused:
+        rh = str(c.get("row_headers") or "")
+        if rh and c.get("type") in ("table", "table_row"):
+            rh_tokens = set(re.findall(r'[A-Za-z][a-z]+', rh))
+            overlap = query_tokens & rh_tokens
+            if overlap:
+                c["score"] = min(0.99, float(c.get("score") or 0) + 0.12 * len(overlap))
+
+    return fused
 
 
 def _is_strong_enough(candidates: List[Dict]) -> bool:

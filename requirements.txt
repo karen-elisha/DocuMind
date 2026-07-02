@@ -31,3 +31,5 @@ sentence-transformers==5.6.0
 
 # Optional UI (repo includes frontend folder)
 streamlit>=1.24.0
+
+pymupdf

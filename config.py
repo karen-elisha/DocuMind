@@ -49,14 +49,15 @@ class Config:
 
     # Retrieval performance tuning
     RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "30"))
-    RERANK_POOL_SIZE = int(os.getenv("RERANK_POOL_SIZE", "35"))
-    RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "10"))
+    RERANK_POOL_SIZE = int(os.getenv("RERANK_POOL_SIZE", "16"))
+    RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "8"))
     RETRIEVAL_STRONG_SCORE = float(os.getenv("RETRIEVAL_STRONG_SCORE", "0.82"))
     RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "512"))
 
     # Ingestion & data storage directories
     UPLOADS_DIR = os.path.join(os.getcwd(), "data", "uploads")
     PROCESSED_DIR = os.path.join(os.getcwd(), "data", "processed")
+    CACHE_DIR = os.path.join(os.getcwd(), "data", "cache")
 
     @classmethod
     def validate(cls):

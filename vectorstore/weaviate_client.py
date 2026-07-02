@@ -33,6 +33,8 @@ class SemanticNode:
 	content: str
 	figure_number: str = ""
 	table_number: str = ""
+	row_headers: str = ""
+	table_title: str = ""
 	embedding: Sequence[float] | None = None
 
 
@@ -105,6 +107,10 @@ class DocuMindWeaviateClient:
 				collection.config.add_property(wc.Property(name="figure_number", data_type=wc.DataType.TEXT))
 			if "table_number" not in existing_props:
 				collection.config.add_property(wc.Property(name="table_number", data_type=wc.DataType.TEXT))
+			if "row_headers" not in existing_props:
+				collection.config.add_property(wc.Property(name="row_headers", data_type=wc.DataType.TEXT))
+			if "table_title" not in existing_props:
+				collection.config.add_property(wc.Property(name="table_title", data_type=wc.DataType.TEXT))
 			return
 
 		client.collections.create(
@@ -119,6 +125,8 @@ class DocuMindWeaviateClient:
                 wc.Property(name="content", data_type=wc.DataType.TEXT),
                 wc.Property(name="figure_number", data_type=wc.DataType.TEXT),
                 wc.Property(name="table_number", data_type=wc.DataType.TEXT),
+                wc.Property(name="row_headers", data_type=wc.DataType.TEXT),
+                wc.Property(name="table_title", data_type=wc.DataType.TEXT),
             ],
         )
 
@@ -219,6 +227,8 @@ class DocuMindWeaviateClient:
 			content=str(required_fields["content"]),
 			figure_number=str(node.get("figure_number", "") or node.get("metadata", {}).get("figure_number", "")),
 			table_number=str(node.get("table_number", "") or node.get("metadata", {}).get("table_number", "")),
+			row_headers=", ".join(node.get("metadata", {}).get("row_headers") or []),
+			table_title=str(node.get("metadata", {}).get("table_title") or ""),
 			embedding=node.get("embedding"),
 		)
 
@@ -281,6 +291,8 @@ class DocuMindWeaviateClient:
 					"content": node.content,
 					"figure_number": node.figure_number,
 					"table_number": node.table_number,
+					"row_headers": node.row_headers,
+					"table_title": node.table_title,
 				}
 				batch.add_object(
 					properties=properties,

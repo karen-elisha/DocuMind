@@ -6,13 +6,15 @@ import io
 import sys
 import shutil
 import threading
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image
 
@@ -27,22 +29,25 @@ from retrieval.hybrid_search import retrieve_candidates, close_shared_client, wa
 from retrieval.reranker import rerank, warm_reranker
 from generation.prompt_builder import build_prompt_from_fusion, build_prompt
 from generation.risk_detector import score_nodes, confidence_from_risk, calculate_confidence, score_text
-from generation.groq_client import chat
+from generation.groq_client import chat, chat_stream
 from generation.fact_verifier import verify_answer
 from retrieval.risk_radar import build_risk_radar
 from demo_questions import get_demo_questions, set_demo_questions
 from generation.demo_question_generator import generate_demo_questions
 from ingestion.mindmap_builder import build_mindmap
+from ingestion.doc_cache import save as cache_save, load as cache_load, delete as cache_delete
 from visualization.graph_snapshot import GraphVisualizer
 
 kg = KnowledgeGraph()
 visualizer = GraphVisualizer()
 pos_expander = PositiveExpander()
 neg_expander = NegativeExpander()
+_query_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="query")
 
 Config.validate()
 os.makedirs(Config.UPLOADS_DIR, exist_ok=True)
 os.makedirs(Config.PROCESSED_DIR, exist_ok=True)
+os.makedirs(Config.CACHE_DIR, exist_ok=True)
 
 _DOCUMENT_INSIGHTS: dict[str, dict] = {}
 
@@ -327,44 +332,66 @@ async def upload_document(file: UploadFile = File(...)):
     doc_id = os.path.splitext(file.filename)[0]
 
     try:
-        parse_result = parse_document(file_path=file_path, doc_id=doc_id)
+        from_cache = False
+        cached = cache_load(doc_id)
 
-        vision_results = {}
-        if Config.ENABLE_VISION:
-            vision_results = summarize_images(parse_result.get("images", []) or [])
+        if cached:
+            # ── Cache hit: skip parse + vision + Weaviate check ──────────
+            parse_result, vision_results, insight = cached
+            from_cache = True
+            stats = {"document_name": parse_result.get("document_name"), "note": "loaded from disk cache"}
+            _DOCUMENT_INSIGHTS[doc_id] = insight
 
-        try:
-            stats = run_ingestion_pipeline(parse_result=parse_result, vision_results=vision_results)
-        except Exception as pipe_exc:
-            print(f"[Upload] Pipeline step failed (non-fatal): {pipe_exc}")
-            import traceback as tb
-            tb.print_exc()
-            stats = {"document_name": parse_result.get("document_name"), "note": f"Pipeline error: {pipe_exc}"}
+        else:
+            # ── Cold path: full parse + vision + embed + store ───────────
+            parse_result = parse_document(file_path=file_path, doc_id=doc_id)
 
-        # Build graph from parsed elements (non-fatal if it fails)
-        try:
-            nodes_for_graph = [
-                {
-                    "id":      el["element_id"],
-                    "type":    el["type"] if el["type"] in VALID_GRAPH_TYPES else "paragraph",
-                    "content": el["content"],
-                    "page":    el["page"],
-                    "section": el.get("metadata", {}).get("section", ""),
-                    "doc_id":  doc_id,
-                }
-                for el in parse_result.get("elements", [])
-                if el.get("content", "").strip()
-            ]
+            vision_results = {}
+            if Config.ENABLE_VISION:
+                vision_results = summarize_images(parse_result.get("images", []) or [])
 
-            if nodes_for_graph:
-                kg.build_from_nodes(nodes_for_graph)
-                neg_expander.detect_negative_edges(kg)
-        except Exception as graph_exc:
-            print(f"[Upload] Graph build failed (non-fatal): {graph_exc}")
+            try:
+                stats = run_ingestion_pipeline(parse_result=parse_result, vision_results=vision_results)
+            except Exception as pipe_exc:
+                print(f"[Upload] Pipeline step failed (non-fatal): {pipe_exc}")
+                import traceback as tb
+                tb.print_exc()
+                stats = {"document_name": parse_result.get("document_name"), "note": f"Pipeline error: {pipe_exc}"}
 
-        # Build insights, then generate demo questions in background (non-blocking)
-        insight = _build_insights(doc_id, parse_result, vision_results)
-        insight["demo_questions"] = []
+            insight = _build_insights(doc_id, parse_result, vision_results)
+            # Save to disk cache for future restarts
+            cache_save(doc_id, parse_result, vision_results, insight)
+
+        # ── Graph build (always runs — fast, in-memory only) ─────────────
+        nodes_for_graph = [
+            {
+                "id":      el["element_id"],
+                "type":    el["type"] if el["type"] in VALID_GRAPH_TYPES else "paragraph",
+                "content": el["content"],
+                "page":    el["page"],
+                "section": el.get("metadata", {}).get("section", ""),
+                "doc_id":  doc_id,
+            }
+            for el in parse_result.get("elements", [])
+            if el.get("content", "").strip()
+        ]
+
+        def _build_graph(nodes):
+            try:
+                if nodes:
+                    kg.build_from_nodes(nodes)
+                    neg_expander.detect_negative_edges(kg)
+            except Exception as graph_exc:
+                print(f"[Upload] Graph build failed (non-fatal): {graph_exc}")
+
+        threading.Thread(target=_build_graph, args=(nodes_for_graph,), daemon=True).start()
+
+        # Snapshot counts before graph thread mutates the graph
+        node_count = len(nodes_for_graph)
+        edge_count = 0
+
+        # ── Demo questions (always async) ─────────────────────────────────
+        insight["demo_questions"] = insight.get("demo_questions") or []
         insight["demo_questions_status"] = "generating"
         _generate_demo_questions_async(doc_id, insight)
 
@@ -372,9 +399,10 @@ async def upload_document(file: UploadFile = File(...)):
             "filename": file.filename,
             "doc_id": doc_id,
             "status": "success",
-            "message": f"Ingested. Graph: {kg.node_count} nodes, {kg.edge_count} edges.",
-            "graph_nodes": kg.node_count,
-            "graph_edges": kg.edge_count,
+            "from_cache": from_cache,
+            "message": f"{'Cache hit' if from_cache else 'Ingested'}. Graph: {node_count} nodes.",
+            "graph_nodes": node_count,
+            "graph_edges": edge_count,
             "stats": stats or {},
             "demo_questions_status": "generating",
         }
@@ -643,8 +671,18 @@ Sections/Headings:
             cross_doc=request.cross_doc,
         )
 
-        # ── Step 3: Cross-Encoder Reranking (prefiltered pool) ─────────
-        reranked = rerank(request.query, all_candidates)
+        # Pre-compute seed_ids for parallel graph expansion
+        _seed_ids_pre = [
+            n.get("node_id") for n in all_candidates
+            if n.get("node_id") and n.get("node_id") in kg.graph.nodes
+        ]
+
+        # ── Step 3+4+5: Rerank + graph expansion in parallel ───────────
+        loop = asyncio.get_event_loop()
+        reranked_fut = loop.run_in_executor(_query_pool, rerank, request.query, all_candidates)
+        pos_fut = loop.run_in_executor(_query_pool, pos_expander.expand, _seed_ids_pre, kg)
+        neg_fut = loop.run_in_executor(_query_pool, neg_expander.expand, _seed_ids_pre, kg)
+        reranked, pos_result, neg_result = await asyncio.gather(reranked_fut, pos_fut, neg_fut)
 
         # ── Step 4: Noise Removal ───────────────────────────────────────
         def _is_noise(node: dict) -> bool:
@@ -687,16 +725,8 @@ Sections/Headings:
             deduped.append(n)
         filtered = deduped
 
-        # ── Graph expansion (for evidence panel only, NOT for confidence) ──
-        seed_ids = [
-            n.get("node_id") for n in filtered
-            if n.get("node_id") and n.get("node_id") in kg.graph.nodes
-        ]
-        pos_result = pos_expander.expand(seed_ids, kg) if seed_ids else {"seed_nodes": [], "evidence": [], "stats": {}}
-        neg_result = neg_expander.expand(seed_ids, kg) if seed_ids else {
-            "exceptions": [], "contradictions": [], "risks": [],
-            "warnings": [], "limitations": [], "overall_risk_level": "None", "stats": {}
-        }
+        # pos_result and neg_result already computed in parallel above
+        # Re-use _seed_ids_pre; pos/neg results are already available
 
         # ── Enrich evidence with View PDF data + media for display ─────
         enriched_supporting = []
@@ -850,7 +880,11 @@ Sections/Headings:
         for bucket in ("exceptions", "contradictions", "risks", "warnings", "limitations", "qualifications"):
             evidence_for_verify.extend(neg_result.get(bucket, []))
 
-        fact_lock = verify_answer(answer, evidence_for_verify)
+        # Skip fact verifier for narrative answers (no numbers) — saves ~50-80ms
+        if re.search(r'\d', answer):
+            fact_lock = verify_answer(answer, evidence_for_verify)
+        else:
+            fact_lock = {"status": "narrative", "score": 1.0, "total_claims": 0, "verified_count": 0, "verified": [], "unverified": []}
         risk_radar = build_risk_radar(filtered, neg_result, kg)
 
         return {
@@ -871,6 +905,60 @@ Sections/Headings:
             "risk_level": overall_risk,
             "documents_used": [request.doc_id] if request.doc_id else [],
         }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/query/stream")
+async def query_pipeline_stream(request: QueryRequest):
+    """Streaming version of /query — returns SSE tokens as they arrive from Groq."""
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    try:
+        all_candidates = retrieve_candidates(
+            request.query, doc_id=request.doc_id, cross_doc=request.cross_doc,
+        )
+        _seed_ids = [
+            n.get("node_id") for n in all_candidates
+            if n.get("node_id") and n.get("node_id") in kg.graph.nodes
+        ]
+        loop = asyncio.get_event_loop()
+        reranked_fut = loop.run_in_executor(_query_pool, rerank, request.query, all_candidates)
+        neg_fut = loop.run_in_executor(_query_pool, neg_expander.expand, _seed_ids, kg)
+        reranked, neg_result = await asyncio.gather(reranked_fut, neg_fut)
+
+        filtered = [n for n in reranked if len(str(n.get("content", "")).strip()) >= 30]
+        filtered = filtered or reranked[:5]
+
+        overall_risk = "None"
+        if neg_result.get("contradictions") or neg_result.get("risks"):
+            from generation.risk_detector import score_nodes
+            risk_result = score_nodes(neg_result.get("contradictions", []) + neg_result.get("risks", []))
+            overall_risk = risk_result.get("overall_risk_level", "None")
+
+        prompt = build_prompt(
+            query=request.query,
+            supporting=filtered,
+            exceptions=neg_result.get("exceptions", []),
+            contradictions=neg_result.get("contradictions", []),
+            risks=neg_result.get("risks", []),
+            overall_risk_level=overall_risk,
+            cross_doc=request.cross_doc,
+        )
+
+        def _sse_generator():
+            try:
+                for token in chat_stream(prompt["user"], system=prompt["system"], factual=prompt.get("factual", False)):
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_sse_generator(), media_type="text/event-stream")
 
     except Exception as e:
         import traceback

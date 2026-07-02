@@ -8,9 +8,10 @@ import {
 } from "lucide-react";
 import {
   checkBackendStatus, uploadDocument, deleteDocument,
-  queryPipeline, getGraphStats, resetCollection,
+  queryPipeline, queryPipelineStream, getGraphStats, resetCollection,
   getDocumentInsights, getFigure, getTable
 } from "@/lib/api";
+import { saveDocList, loadDocList } from "@/lib/docCache";
 import dynamic from "next/dynamic";
 import DocumentInsights from "@/components/DocumentInsights";
 import FigureViewer from "@/components/FigureViewer";
@@ -49,6 +50,7 @@ export default function Workspace() {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadingFilename, setUploadingFilename] = useState<string | null>(null);
+  const [cacheHitDoc, setCacheHitDoc] = useState<string | null>(null);
   const [showGraph, setShowGraph] = useState(false);
   const [showMindMap, setShowMindMap] = useState(false);
   const [activeNode, setActiveNode] = useState<any>(null);
@@ -86,8 +88,16 @@ export default function Workspace() {
     }
   }, [isDark]);
 
+  // Restore docs from browser cache on first load
   useEffect(() => {
-    checkBackendStatus().then(setBackendOk);
+    const savedDocs = loadDocList();
+    if (savedDocs.length > 0) {
+      setDocs(savedDocs);
+    }
+
+    checkBackendStatus().then((ok) => {
+      setBackendOk(ok);
+    });
     getGraphStats().then(setStats).catch(() => {});
   }, []);
 
@@ -109,17 +119,23 @@ export default function Workspace() {
     if (!file) return;
     setUploading(true);
     setUploadingFilename(file.name);
+    setCacheHitDoc(null);
     try {
       const result = await uploadDocument(file);
       const name = file.name;
-      if (!docs.includes(name)) {
-        setDocs([...docs, name]);
-      }
+      const newDocs = docs.includes(name) ? docs : [...docs, name];
+      setDocs(newDocs);
+      saveDocList(newDocs);
       setTargetDoc(name);
+
+      if (result.from_cache) {
+        setCacheHitDoc(name);
+        setTimeout(() => setCacheHitDoc(null), 4000);
+      }
+
       getGraphStats().then(setStats).catch(() => {});
-      // Load insights after successful upload
       if (result.doc_id) {
-        await loadInsights(result.doc_id);
+        await loadInsights(result.doc_id as string);
         setShowInsights(true);
         setDemoRefresh((k) => k + 1);
       }
@@ -135,7 +151,9 @@ export default function Workspace() {
   const handleDelete = async (filename: string) => {
     try {
       await deleteDocument(filename);
-      setDocs(docs.filter(d => d !== filename));
+      const newDocs = docs.filter(d => d !== filename);
+      setDocs(newDocs);
+      saveDocList(newDocs);
       if (targetDoc === filename) {
         setTargetDoc("");
         setInsights(null);
@@ -151,6 +169,7 @@ export default function Workspace() {
     try {
       await resetCollection();
       setDocs([]);
+      saveDocList([]);
       setMessages([]);
       setShowGraph(false);
       setShowMindMap(false);
@@ -185,44 +204,55 @@ export default function Workspace() {
     try {
       const activeDocId = overrideDocId
         || (targetDoc ? targetDoc.split('.')[0] : undefined);
-      const res = await queryPipeline(userMsg.trim(), activeDocId, crossDoc);
 
-      if (res.routed) {
-        const msg: Message = {
-          role: "assistant",
-          content: `**${res.routed_type === "table" ? "Table" : res.routed_type === "chart" ? "Chart" : "Figure"} ${res.routed_number}** — routed directly from document.`,
-          meta: {
-            routed: true,
-            routed_type: res.routed_type,
-            routed_number: res.routed_number,
-            figure: res.figure,
-            table: res.table,
-            nearby_text: res.nearby_text,
-            confidence_score: res.confidence_score,
-            risk_level: res.risk_level,
-            documents_used: res.documents_used,
-            fact_lock: res.fact_lock,
-            risk_radar: res.risk_radar,
-          }
-        };
-        setMessages(prev => [...prev, msg]);
+      // Check for figure/table routing first (non-streaming)
+      const isRouted = /(?:figure|fig|table|chart)[.\s]*\d+/i.test(userMsg);
 
-        if (res.figure) {
-          setViewerFigure(res.figure);
-          setViewerNearbyText(res.nearby_text || "");
+      if (isRouted) {
+        const res = await queryPipeline(userMsg.trim(), activeDocId, crossDoc);
+        if (res.routed) {
+          const msg: Message = {
+            role: "assistant",
+            content: `**${res.routed_type === "table" ? "Table" : res.routed_type === "chart" ? "Chart" : "Figure"} ${res.routed_number}** — routed directly from document.`,
+            meta: { routed: true, routed_type: res.routed_type, routed_number: res.routed_number, figure: res.figure, table: res.table, nearby_text: res.nearby_text, confidence_score: res.confidence_score, risk_level: res.risk_level, documents_used: res.documents_used, fact_lock: res.fact_lock, risk_radar: res.risk_radar }
+          };
+          setMessages(prev => [...prev, msg]);
+          if (res.figure) { setViewerFigure(res.figure); setViewerNearbyText(res.nearby_text || ""); }
+          if (res.table) setViewerTable({ ...res.table, nearbyText: res.nearby_text });
+          return;
         }
-        if (res.table) {
-          const tbl = { ...res.table, nearbyText: res.nearby_text };
-          setViewerTable(tbl);
-        }
-      } else {
-        const msg: Message = {
-          role: "assistant",
-          content: res.answer || "No answer returned.",
-          meta: res,
-        };
-        setMessages(prev => [...prev, msg]);
       }
+
+      // Run streaming (for perceived speed) + full query (for meta) in parallel
+      let streamedContent = "";
+      setMessages(prev => [...prev, { role: "assistant", content: "" }]);
+
+      const [streamErr, fullRes] = await Promise.all([
+        queryPipelineStream(userMsg.trim(), activeDocId, crossDoc, (token) => {
+          streamedContent += token;
+          setMessages(prev => {
+            const updated = [...prev];
+            updated[updated.length - 1] = { role: "assistant", content: streamedContent };
+            return updated;
+          });
+        }).then(() => null).catch((e) => e),
+        queryPipeline(userMsg.trim(), activeDocId, crossDoc),
+      ]);
+
+      // If stream failed (e.g. rate limit), fall back to full response answer
+      const finalContent = streamedContent || (streamErr ? `⚠️ ${streamErr.message}` : fullRes.answer || "");
+
+      // Attach meta from full response once both finish — keep streamed content, only add meta
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: "assistant",
+          content: finalContent,
+          meta: { ...fullRes, answer: undefined },
+        };
+        return updated;
+      });
+
     } catch (err) {
       console.error(err);
       setMessages(prev => [...prev, { role: "assistant", content: "Query failed. Ensure the FastAPI backend is running on port 8000." }]);
@@ -334,6 +364,11 @@ export default function Workspace() {
             <span className="text-sm font-medium text-slate-600 dark:text-slate-400 text-center px-4 truncate w-full">
               {uploading ? `Ingesting ${uploadingFilename}...` : 'Drop files here or click'}
             </span>
+            {cacheHitDoc && (
+              <span className="mt-1 text-[10px] font-bold text-emerald-500 uppercase tracking-wider animate-pulse">
+                ⚡ Loaded from cache
+              </span>
+            )}
           </label>
 
           {docs.length > 0 && (
@@ -343,7 +378,13 @@ export default function Workspace() {
                 <div key={doc} className="group bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/50 rounded-xl p-3 flex items-center justify-between hover:border-emerald-500/50 dark:hover:border-emerald-500/50 transition-all">
                   <div className="flex items-center gap-3 overflow-hidden flex-1">
                     <FileText className="w-4 h-4 text-emerald-500 flex-shrink-0" />
-                    <div className="truncate text-sm font-medium text-slate-700 dark:text-slate-300">{doc}</div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-slate-700 dark:text-slate-300">{doc}</div>
+                      {cacheHitDoc === doc && (
+                        <div className="text-[9px] font-bold text-emerald-500 uppercase tracking-wider">⚡ cached</div>
+                      )}
+
+                    </div>
                   </div>
                   <div className="flex items-center gap-1">
                     {insights && (

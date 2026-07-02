@@ -100,6 +100,12 @@ def _enrich_chunk_content(content: str, metadata: Dict[str, Any], document_name:
         parts.append(f"[Document: {document_name}]")
     if section:
         parts.append(f"[Section: {section}]")
+    college = metadata.get("college_context", "")
+    if college:
+        parts.append(f"[College: {college}]")
+    col_headers = metadata.get("col_headers", "")
+    if col_headers:
+        parts.append(f"[Columns: {col_headers}]")
     if not parts:
         return content
     return " ".join(parts) + "\n" + content
@@ -139,10 +145,9 @@ def _safe_int(x: Any, default: int = 1) -> int:
 
 def _merge_short_nodes(nodes: List[Node]) -> List[Node]:
     """
-    Merge consecutive short fragments on the same page and of the same type
-    into a single node so that split inline text like:
-        'Timeline:' + '24 hours |' + 'Team:' + '4 members'
-    becomes one node: 'Timeline: 24 hours | Team: 4 members'
+    Merge consecutive short fragments on the same page into a single node.
+    For cutoff-sheet docs: merges split course name paragraphs + their rank footnote
+    into one node: 'COMPUTER SCIENCE AND ENGINEERING | 514 -- 1088 985 ...'
     """
     if not nodes:
         return nodes
@@ -151,29 +156,33 @@ def _merge_short_nodes(nodes: List[Node]) -> List[Node]:
     i = 0
     while i < len(nodes):
         node = nodes[i]
-        # Only merge paragraph/list_item fragments
+
         if node.type not in MERGEABLE_TYPES or len(node.content) >= MIN_CONTENT_LEN:
             merged.append(node)
             i += 1
             continue
 
-        # Accumulate consecutive short siblings on the same page
+        # Accumulate consecutive short siblings on the same page (any mergeable type)
         parts = [node.content]
         j = i + 1
         while j < len(nodes):
             nxt = nodes[j]
-            if (
-                nxt.type in MERGEABLE_TYPES
-                and nxt.page == node.page
-                and nxt.doc_id == node.doc_id
-                and len(" ".join(parts)) < MIN_CONTENT_LEN
-            ):
+            same_page = nxt.page == node.page and nxt.doc_id == node.doc_id
+            if not same_page:
+                break
+            # Pull in more short paragraphs
+            if nxt.type in MERGEABLE_TYPES and len(" ".join(parts)) < MIN_CONTENT_LEN:
                 parts.append(nxt.content)
                 j += 1
+            # Pull in the immediately following footnote (rank numbers)
+            elif nxt.type == "footnote" and len(" ".join(parts)) < MIN_CONTENT_LEN * 3:
+                parts.append(nxt.content)
+                j += 1
+                break  # one footnote per course row
             else:
                 break
 
-        combined = " ".join(parts).strip()
+        combined = " | ".join(p.strip() for p in parts if p.strip())
         merged.append(Node(
             node_id=node.node_id,
             doc_id=node.doc_id,
@@ -228,6 +237,13 @@ def build_nodes(
         if isinstance(v, dict) and v.get("image_path"):
             image_summaries_by_path[v["image_path"]] = v.get("vision_summary", "")
 
+    # Detect college-context documents (e.g. KCET cutoff sheets)
+    # Pattern: paragraph starting with "College: EXXX <name>"
+    _COLLEGE_RE = re.compile(r'^College\s*:\s*(\S+\s+.{5,})', re.IGNORECASE)
+    _HEADER_RE = re.compile(r'^Course\s*Name\s+(1G|GM|SCG)', re.IGNORECASE)
+    current_college: str = ""
+    current_col_headers: str = ""
+
     for el in elements:
         el_type = el.get("type")
         if el_type not in SUPPORTED_NODE_TYPES:
@@ -236,9 +252,22 @@ def build_nodes(
         content = el.get("content") or ""
         metadata = dict(el.get("metadata") or {})
 
-        # Skip truly empty non-image nodes; short ones get merged below
         if el_type != "image" and not content.strip():
             continue
+
+        # Track current college context
+        if el_type == "paragraph":
+            m = _COLLEGE_RE.match(content.strip())
+            if m:
+                current_college = content.strip()
+                current_col_headers = ""  # reset headers for new college
+            elif _HEADER_RE.match(content.strip()):
+                current_col_headers = content.strip()
+
+        if current_college:
+            metadata["college_context"] = current_college
+        if current_col_headers:
+            metadata["col_headers"] = current_col_headers
 
         node = Node(
             node_id=el.get("element_id") or _node_id(el_type),
@@ -440,6 +469,35 @@ def chunk_nodes(
             ))
         elif ntype in ("table", "table_row", "image", "formula", "caption", "fact"):
             flush_buffer()
+            # Tag table/table_row chunks with row headers and table title
+            # so cross-table segment linking works (e.g. "Industrial" across Note 3 + Item 7)
+            if ntype in ("table", "table_row"):
+                raw_content = content
+                headers = base_metadata.get("table_headers") or []
+                rows = base_metadata.get("table_rows") or []
+                table_title = base_metadata.get("table_caption") or base_metadata.get("table_title") or ""
+                table_number = base_metadata.get("table_number") or ""
+
+                # Extract row header labels (first cell of each row)
+                row_headers = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()] if rows else []
+                # Also pull from header row itself
+                if headers:
+                    row_headers = list(dict.fromkeys(headers[:1] + row_headers))  # dedupe, preserve order
+
+                # Prepend table title + row headers into content so BM25 + vector both hit segment names
+                prefix_parts = []
+                if table_title:
+                    prefix_parts.append(f"[Table: {table_title}]")
+                if table_number:
+                    prefix_parts.append(f"[Table Number: {table_number}]")
+                if row_headers:
+                    prefix_parts.append(f"[Row Headers: {', '.join(row_headers[:20])}]")
+                if prefix_parts:
+                    content = " ".join(prefix_parts) + "\n" + raw_content
+
+                base_metadata["row_headers"] = row_headers
+                base_metadata["table_title"] = table_title
+
             chunks.append(_make_chunk(
                 doc_id=doc_id,
                 document_name=document_name,
@@ -450,11 +508,24 @@ def chunk_nodes(
                 source_node_id=str(node.get("node_id") or ""),
             ))
         else:
-            if buffer_len + len(content) > chunk_size and buffer_len > 0:
+            # For college-context docs (KCET cutoff sheets), each course row is its own chunk
+            if node.get("metadata", {}).get("college_context") and "|" in content:
                 flush_buffer()
-            buffer_content.append(content)
-            buffer_len += len(content)
-            buffer_nodes.append(node)
+                chunks.append(_make_chunk(
+                    doc_id=doc_id,
+                    document_name=document_name,
+                    page=int(node.get("page") or 1),
+                    chunk_type="text_chunk",
+                    content=content,
+                    metadata=base_metadata,
+                    source_node_id=str(node.get("node_id") or ""),
+                ))
+            else:
+                if buffer_len + len(content) > chunk_size and buffer_len > 0:
+                    flush_buffer()
+                buffer_content.append(content)
+                buffer_len += len(content)
+                buffer_nodes.append(node)
 
     flush_buffer()
 

@@ -122,73 +122,48 @@ def summarize_images(
 
     iterable = images or []
     if max_images is not None:
-        iterable = iterable[: max_images]
+        iterable = iterable[:max_images]
 
-    for idx, img in enumerate(iterable):
+    invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+
+    def _process_one(idx_img):
+        idx, img = idx_img
         image_path = img.get("image_path")
         page = int(img.get("page") or 1)
-
         if not image_path or not os.path.exists(image_path):
-            continue
-
+            return None, None
         image_key = img.get("image_element_id") or f"image_{idx}_p{page}"
-
         with open(image_path, "rb") as f:
-            image_bytes = f.read()
-
-        import base64
-
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json"
-        }
-        
+            b64 = base64.b64encode(f.read()).decode("utf-8")
         payload = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_SYSTEM_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
-                        },
-                    ]
-                }
-            ],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _VISION_SYSTEM_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}],
             "max_tokens": 500,
             "temperature": 0.2,
             "top_p": 1.00,
-            "stream": False
+            "stream": False,
         }
-        
         try:
             response = requests.post(invoke_url, headers=headers, json=payload)
-            response_data = response.json()
-            raw = response_data["choices"][0]["message"]["content"].strip()
-            
+            raw = response.json()["choices"][0]["message"]["content"].strip()
             parsed = _parse_vision_response(raw)
-
-            summary_text = parsed.get("summary", "")
-            if not summary_text:
-                summary_text = f"[Figure {parsed.get('figure_number', '')}] {parsed.get('title', '') or parsed.get('chart_type', '') or 'diagram'}. {parsed.get('conclusion', '') or ''}"
-
-            results[image_key] = {
-                "page": page,
-                "image_path": image_path,
-                "vision_summary": summary_text,
-                "vision_detail": parsed,
-            }
+            summary_text = parsed.get("summary", "") or (
+                f"[Figure {parsed.get('figure_number', '')}] "
+                f"{parsed.get('title', '') or parsed.get('chart_type', '') or 'diagram'}. "
+                f"{parsed.get('conclusion', '') or ''}"
+            )
+            return image_key, {"page": page, "image_path": image_path, "vision_summary": summary_text, "vision_detail": parsed}
         except Exception:
-            results[image_key] = {
-                "page": page,
-                "image_path": image_path,
-                "vision_summary": f"[Image page {page}] {img.get('caption', 'image')}",
-                "vision_detail": {},
-            }
+            return image_key, {"page": page, "image_path": image_path, "vision_summary": f"[Image page {page}] {img.get('caption', 'image')}", "vision_detail": {}}
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=min(4, len(iterable) or 1)) as pool:
+        for key, val in pool.map(_process_one, enumerate(iterable)):
+            if key is not None:
+                results[key] = val
 
     return results

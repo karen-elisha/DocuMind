@@ -38,6 +38,11 @@ CRITICAL RULES:
 7. If evidence is insufficient, say "The evidence does not contain this information" — do not guess.
 8. Cite page numbers for each key figure.
 
+DOMAIN LOGIC — Comparing figures across sections:
+- When figures from different sections (e.g. Item 7 vs. Note 1) appear to differ, first check whether the metrics are structurally different (e.g. segment-level operating income vs. company-wide net cash flows) before assuming a numerical error or reclassification.
+- A difference in numbers across sections is NOT a discrepancy unless both sections are measuring the exact same metric at the same scope and time period.
+- Always identify the definition and scope of each metric before comparing.
+
 {OUTPUT_FORMAT_RULES}"""
 
 
@@ -48,6 +53,11 @@ Your answers must:
 2. Explicitly surface any exceptions, contradictions, or risks found in the evidence.
 3. Qualify your answer when risk evidence is present — never ignore it.
 4. Cite the source node type and page number for key claims.
+
+DOMAIN LOGIC — Comparing figures across sections:
+- When figures from different sections (e.g. Item 7 vs. Note 1) appear to differ, first check whether the metrics are structurally different (e.g. segment-level operating income vs. company-wide net cash flows) before assuming a numerical error or reclassification.
+- A difference in numbers across sections is NOT a discrepancy unless both sections are measuring the exact same metric at the same scope and time period.
+- Always identify the definition and scope of each metric before comparing.
 
 {OUTPUT_FORMAT_RULES}"""
 
